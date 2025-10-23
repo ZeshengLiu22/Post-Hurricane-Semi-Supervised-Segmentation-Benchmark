@@ -1,4 +1,4 @@
-# NeurIPS25-D&B-Submission
+# Semi-Supervised Semantic Segmentation on Post-Hurricane Dataset
 
 This is the detailed readme for our code submission on paper "Benchmarking Semi-Supervised Semantic Segmentation Models for Post-Disaster Scenes Understanding".
 
@@ -8,6 +8,39 @@ You can access the fully-supervised Floodnet dataset at [this](https://www.dropb
 
 We use the semi-supervised version from [this](https://github.com/BinaLab/RescueNet-Challenge2023?tab=readme-ov-file) link (RescueNet) and [this](https://github.com/BinaLab/FloodNet-Challenge-EARTHVISION2021) link (FloodNet).
 
+## UniMatch
+Follow the environment instructions on the [UniMatch](https://github.com/LiheYoung/UniMatch) github. then organize your datasets as the following:
+```
+├── ./dataset
+    ├── RescueNet
+        ├── train-set
+          ├── train-org-img
+          ├── train-label-img
+        ├── val
+          ├── val-org-img
+          ├── val-label-img
+    ├── FloodNet
+        ├── train
+            ├── train-org-img
+            ├── train-label-img
+        ├── val
+            ├── val-org-img
+            ├── val-label-img
+```
+modify the train.sh file. 
+ - For Rescuenet change dataset to 'rescuenet' and split to train-set
+ - For Floodnet change dataset to floodnet and split to train.
+ - For training the method set method to unimatch
+ - For evaluation set method to evaluate 
+
+
+Run bash scripts/train.sh [NUM_GPUS] [PORT]
+
+## ClassMix
+Follow the environment instructions on the [UniMatch](https://github.com/WilhelmT/ClassMix) github. and structure your data the same as in UniMatch.
+
+Then run python3 trainSSL.py --config ./configs/{DATASET}.json --name name_of_training
+For evaluation run python evaluateSSL.py -m {PATH TO PRE-TRAINED MODEL}
 
 ## ReCo
 
@@ -90,7 +123,7 @@ You may also need to modify the data file path and other hyperparameter in "conf
 
 To train S4MC on RescueNet and FloodNet:
 ```
-nohup torchrun --nproc_per_node=6 train_semi.py --config config_floodnet.yaml --seed 42 --name floodnet
+nohup torchrun --nproc_per_node=8 train_semi.py --config config_floodnet.yaml --seed 42 --name floodnet
 
 nohup torchrun --nproc_per_node=8 train_semi.py --config config_rescuenet.yaml --seed 42 --name rescuenet
 ```
@@ -183,6 +216,3 @@ python tools/eval-dual-teacher-floodnet.py   --val-img-dir data/floodnet/images/
 python tools/eval-dual-teacher-rescuenet.py   --val-img-dir data/rescuenet/images/val-org-img   --val-mask-dir data/rescuenet/annotations/val-label-img   --checkpoint RescueNet_Best_weights.pth   --save-dir ./rescuenet_predictions
 ```
 
-## ClassMix
-
-## UniMatch
