@@ -1,5 +1,7 @@
 # Post-Hurricane Semi-Supervised Segmentation
 
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Code release for **Benchmarking Semi-Supervised Semantic Segmentation Models for Post-Disaster Scene Understanding**.
 
 This repository adapts five semi-supervised semantic segmentation methods to FloodNet and RescueNet post-hurricane imagery. It includes shared data preparation, split generation, benchmark launchers, and final evaluation scripts so the methods can be run under one common protocol.
