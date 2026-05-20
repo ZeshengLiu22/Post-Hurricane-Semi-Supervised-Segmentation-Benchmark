@@ -11,7 +11,7 @@ model = dict(
         feature_strides=[4, 8, 16, 32],
         channels=128,
         dropout_ratio=0.1,
-        num_classes=150,
+        num_classes=11,
         norm_cfg=dict(type='SyncBN', requires_grad=True),
         align_corners=False,
         decoder_params=dict(embed_dim=256),
