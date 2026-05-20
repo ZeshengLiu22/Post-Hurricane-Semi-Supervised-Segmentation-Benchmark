@@ -11,8 +11,14 @@ import argparse
 import copy
 import os
 import os.path as osp
+import sys
 import time
 import logging
+
+DUAL_TEACHER_ROOT = osp.abspath(osp.join(osp.dirname(__file__), '..'))
+if DUAL_TEACHER_ROOT not in sys.path:
+    sys.path.insert(0, DUAL_TEACHER_ROOT)
+
 import mmcv
 import torch
 from mmcv.runner import init_dist
@@ -44,13 +50,34 @@ warnings.filterwarnings("ignore")
 criterion_u = torch.nn.CrossEntropyLoss(reduction='none').cuda()
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ('yes', 'true', 't', '1', 'y'):
+        return True
+    if value in ('no', 'false', 'f', '0', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def dataloader_kwargs(num_workers, args):
+    kwargs = {'pin_memory': args.pin_memory}
+    if num_workers > 0:
+        kwargs['prefetch_factor'] = args.prefetch_factor
+        kwargs['persistent_workers'] = args.persistent_workers
+    return kwargs
+
+
 def train_sup(args, model, optimizer, train_loader, val_loader, criterion, max_iters, print_iters, eval_iters):
     train_iterator = iter(train_loader)
+    amp_enabled = args.amp and torch.cuda.is_available()
+    amp_dtype = torch.float16
     if args.ddp:
         rank, world_size = dist.get_rank(), dist.get_world_size()
     else:
         rank = 0
-    for epoch in range(200):
+    for epoch in range(args.epochs):
         for i in range(len(train_loader)):
 
             model.train()
@@ -62,9 +89,10 @@ def train_sup(args, model, optimizer, train_loader, val_loader, criterion, max_i
 
             image = batch_data['img'].data[0].cuda(non_blocking=True)
             label = batch_data['gt_semantic_seg'].data[0].squeeze(dim=1).cuda(non_blocking=True)
-            outputs = model(image)
-            outputs = F.interpolate(outputs, size=label.shape[1:], mode='bilinear', align_corners=False)
-            seg_loss = criterion(outputs, label.type(torch.long))
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                outputs = model(image)
+                outputs = F.interpolate(outputs, size=label.shape[1:], mode='bilinear', align_corners=False)
+                seg_loss = criterion(outputs, label.type(torch.long))
 
             optimizer.zero_grad()
             seg_loss.backward()
@@ -77,7 +105,8 @@ def train_sup(args, model, optimizer, train_loader, val_loader, criterion, max_i
             print("Iter: %d; LR: %.3e; seg_loss: %f" % (i + 1, lr, seg_loss.item()))
             logging.info('[iter:{}] Validation:'.format(i + 1))
             print('[iter:{}] Validation:'.format(i + 1))
-            val_score = val(model.module, val_loader)
+            val_model = model.module if hasattr(model, 'module') else model
+            val_score = val(val_model, val_loader, args.amp)
             logging.info('mIoU:{:.5f}'.format(val_score['Mean IoU'] * 100))
             print('mIoU:{:.5f}'.format(val_score['Mean IoU'] * 100))
             
@@ -85,7 +114,7 @@ def train_sup(args, model, optimizer, train_loader, val_loader, criterion, max_i
             if val_score['Mean IoU'] * 100 > best_miou:
                 best_miou = val_score['Mean IoU'] * 100
                 # Save the model weights if it's the best mIoU
-                torch.save(model.state_dict(), "Best_weights.pth")
+                torch.save(model.state_dict(), osp.join(args.save_path, "best_weights.pth"))
                 logging.info("New best mIoU found. Model weights saved.")
                 print("New best mIoU found. Model weights saved.")
                 
@@ -96,12 +125,14 @@ def train_sup(args, model, optimizer, train_loader, val_loader, criterion, max_i
 
 
 def train_dual(args, model, model_teacher, model_teacher2, optimizer, train_loader, train_loader_u, val_loader, criterion, cm_loss_fn, max_iters, print_iters, eval_iters):
+    amp_enabled = args.amp and torch.cuda.is_available()
+    amp_dtype = torch.float16
     if args.ddp:
         rank, world_size = dist.get_rank(), dist.get_world_size()
     else:
         rank = 0
     best_miou, best_epoch = 0, 0
-    for epoch in range(200):
+    for epoch in range(args.epochs):
         model.train()
         train_loader.sampler.set_epoch(epoch)
         train_loader_u.sampler.set_epoch(epoch)
@@ -144,13 +175,14 @@ def train_dual(args, model, model_teacher, model_teacher2, optimizer, train_load
             image_u_strong = transforms.ColorJitter(0.5, 0.5, 0.5, 0.25)(image_u_strong)
             image_u_strong = transforms.RandomGrayscale(p=0.2)(image_u_strong)
 
-            if do_class_mix:
-                loss = compute_classmix(b, h, w, criterion, cm_loss_fn, model, ema_model, image, label, image_u, image_u_strong, threshold=0.95)
-            if do_cut_mix:
-                loss = compute_cutmix(h, w, image, label, criterion, model, ema_model, image_u, threshold=0.95)
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                if do_class_mix:
+                    loss = compute_classmix(b, h, w, criterion, cm_loss_fn, model, ema_model, image, label, image_u, image_u_strong, threshold=0.95)
+                if do_cut_mix:
+                    loss = compute_cutmix(h, w, image, label, criterion, model, ema_model, image_u, threshold=0.95)
 
-            loss_dc = compute_ic(model, ema_model, image_u, image_u_strong, criterion_u, label_u, h, w, threshold=0.95)
-            total_loss = loss + loss_dc * 0.2
+                loss_dc = compute_ic(model, ema_model, image_u, image_u_strong, criterion_u, label_u, h, w, threshold=0.95)
+                total_loss = loss + loss_dc * 0.2
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -172,13 +204,14 @@ def train_dual(args, model, model_teacher, model_teacher2, optimizer, train_load
             logging.info('[Epoch {}] [iter:{}] Validation:'.format(epoch, i + 1))
             print('[Epoch {}] [iter:{}] Validation:'.format(epoch, i + 1))
 
-            val_score = val(model.module, val_loader)
+            val_model = model.module if hasattr(model, 'module') else model
+            val_score = val(val_model, val_loader, args.amp)
             miou = val_score['Mean IoU'] * 100
             if miou > best_miou:
                 best_miou = miou
                 best_epoch = epoch
                 # Save the model weights if it's the best mIoU
-                torch.save(model.state_dict(), "RescueNet_Best_weights.pth")
+                torch.save(model.state_dict(), osp.join(args.save_path, "best_weights.pth"))
                 logging.info("New best mIoU found. Model weights saved.")
                 print("New best mIoU found. Model weights saved.")
             logging.info('mIoU:{:.5f} Best mIOU:{:.5f} on epoch {}'.format(miou, best_miou, best_epoch))
@@ -200,15 +233,16 @@ def synchronize():
     dist.barrier()
 
 
-def val(model, data_loader):
+def val(model, data_loader, amp_enabled=False):
     model.eval()
     preds, gts = [], []
     for i, data in enumerate(data_loader):
         with torch.no_grad():
             image = data['img'][0].cuda(non_blocking=True)
             label = data['gt_semantic_seg'][0].cuda(non_blocking=True)
-            outputs = model(image)
-            resized_outputs = F.interpolate(outputs, size=label.shape[1:], mode='bilinear', align_corners=False)
+            with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available(), dtype=torch.float16):
+                outputs = model(image)
+                resized_outputs = F.interpolate(outputs, size=label.shape[1:], mode='bilinear', align_corners=False)
 
             preds += list(torch.argmax(resized_outputs, dim=1).cpu().numpy().astype(np.int16))
             gts += list(label.cpu().numpy().astype(np.int16))
@@ -221,6 +255,7 @@ def val(model, data_loader):
 def val_ddp(args, epoch, model, data_loader):
     model.eval()
     preds, gts = [], []
+    amp_enabled = args.amp and torch.cuda.is_available()
     if args.ddp:
         data_loader.sampler.set_epoch(epoch)
         rank, world_size = dist.get_rank(), dist.get_world_size()
@@ -232,8 +267,9 @@ def val_ddp(args, epoch, model, data_loader):
             image = data['img'][0].cuda(non_blocking=True)
             label = data['gt_semantic_seg'][0].cuda(non_blocking=True)
 
-            outputs = model(image)
-            resized_outputs = F.interpolate(outputs, size=label.shape[1:], mode='bilinear', align_corners=False)
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=torch.float16):
+                outputs = model(image)
+                resized_outputs = F.interpolate(outputs, size=label.shape[1:], mode='bilinear', align_corners=False)
 
             preds += list(torch.argmax(resized_outputs, dim=1).cpu().numpy().astype(np.int16))
             gts += list(label.cpu().numpy().astype(np.int16))
@@ -289,7 +325,7 @@ def setup_logger(filename='test.log'):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train a segmentor')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local_rank', '--local-rank', dest='local_rank', type=int, default=0)
     parser.add_argument('--ddp', default=False, action='store_true')
     parser.add_argument('--dual_teacher', default=False, action='store_true')
     parser.add_argument('--unimatch_aug', default=False, action='store_true')
@@ -309,12 +345,27 @@ def parse_args():
     parser.add_argument("--backbone", type=str)
     parser.add_argument("--port", default=None, type=int)
     parser.add_argument('--dc', default=False, action='store_true')
+    parser.add_argument('--epochs', default=150, type=int)
+    parser.add_argument('--split', default='25', choices=['12_5', '25', '50'])
+    parser.add_argument('--num-workers', default=8, type=int)
+    parser.add_argument('--val-num-workers', default=8, type=int)
+    parser.add_argument('--pin-memory', default=True, type=str2bool)
+    parser.add_argument('--prefetch-factor', default=2, type=int)
+    parser.add_argument('--persistent-workers', default=True, type=str2bool)
+    parser.add_argument('--amp', default=False, type=str2bool)
 
     args = parser.parse_args()
     # if 'LOCAL_RANK' not in os.environ:
     #     os.environ['LOCAL_RANK'] = str(args.local_rank)
 
     return args
+
+
+def set_split_data_root(cfg, dataset, split):
+    data_root = osp.join('data', f'{dataset}_{split}')
+    for section in ('train', 'train_semi_l', 'train_semi_u', 'val', 'test'):
+        if section in cfg.data:
+            cfg.data[section].data_root = data_root
 
 
 def np2tmp(array, temp_file_name=None):
@@ -347,9 +398,10 @@ def image_saver(input, name):
 
 
 def main():
-    setup_logger()
-
     args = parse_args()
+    if args.amp:
+        print('WARNING: Dual-Teacher AMP was requested but is forced off for numerical stability.')
+        args.amp = False
     mit_type = args.backbone[-1]
     if mit_type == '5':
         args.config = 'local_configs/segformer/B' + mit_type + '/segformer.b' + mit_type + '.640x640.rescuenet.160k.py'
@@ -359,15 +411,18 @@ def main():
     cfg = Config.fromfile(args.config)
     if args.options is not None:
         cfg.merge_from_dict(args.options)
+    set_split_data_root(cfg, 'rescuenet', args.split)
     torch.backends.cudnn.benchmark = False
 
-    # work_dir is determined in this priority: CLI > segment in file > filename
+    # work_dir is determined in this priority: CLI > segment in file > filename.
+    # For generated benchmark runs, append the split to avoid checkpoint/log collisions.
     if args.work_dir is not None:
-        # update configs according to CLI args if args.work_dir is not None
         cfg.work_dir = args.work_dir
-    elif cfg.get('work_dir', None) is None:
-        # use config filename as default work_dir if cfg.work_dir is None
-        cfg.work_dir = osp.join('./work_dirs', osp.splitext(osp.basename(args.config))[0])
+    else:
+        base_work_dir = cfg.get('work_dir', None)
+        if base_work_dir is None:
+            base_work_dir = osp.join('./work_dirs', osp.splitext(osp.basename(args.config))[0])
+        cfg.work_dir = osp.join(base_work_dir, f'split{args.split}')
     if args.load_from is not None:
         cfg.load_from = args.load_from
     if args.resume_from is not None:
@@ -385,11 +440,13 @@ def main():
         rank = 0
     # create work_dir
     mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
+    args.save_path = cfg.work_dir
     # dump config
     cfg.dump(osp.join(cfg.work_dir, osp.basename(args.config)))
     # init the logger before other steps
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     log_file = osp.join(cfg.work_dir, f'{timestamp}.log')
+    setup_logger(log_file)
     logger = get_root_logger(log_file=log_file, log_level=cfg.log_level)
 
     meta = dict()
@@ -498,37 +555,37 @@ def main():
         build_dataloader(
             ds,
             samples_per_gpu=batch_size,
-            workers_per_gpu=0,
+            workers_per_gpu=args.num_workers,
             num_gpus=1,
             dist=distributed,
             shuffle=shuffle,
             seed=cfg.seed,
             drop_last=True,
-            pin_memory=True) for ds in datasets
+            **dataloader_kwargs(args.num_workers, args)) for ds in datasets
     ]
     train_loader_u = [
         build_dataloader(
             ds,
             samples_per_gpu=batch_size,
-            workers_per_gpu=0,
+            workers_per_gpu=args.num_workers,
             num_gpus=1,
             dist=distributed,
             shuffle=shuffle,
             seed=cfg.seed,
             drop_last=True,
-            pin_memory=True) for ds in datasets_u
+            **dataloader_kwargs(args.num_workers, args)) for ds in datasets_u
     ]
     val_loader = [
         build_dataloader(
             ds,
             samples_per_gpu=1,
-            workers_per_gpu=0,
+            workers_per_gpu=args.val_num_workers,
             num_gpus=1,
             dist=distributed,
             shuffle=False,
             seed=cfg.seed,
             drop_last=False,
-            pin_memory=True) for ds in datasets_val
+            **dataloader_kwargs(args.val_num_workers, args)) for ds in datasets_val
     ]
 
     criterion = torch.nn.CrossEntropyLoss(ignore_index=255).cuda()
@@ -538,4 +595,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

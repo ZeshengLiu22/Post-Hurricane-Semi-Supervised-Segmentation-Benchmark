@@ -27,6 +27,6 @@ def get_data_path(name):
     if name == 'pascal_voc':
         return '../data/VOC2012/'
     if name == 'rescuenet':
-        return '../../../data/jpk322/RescueNet/'
+        return './dataset/rescuenet/'
     if name == 'floodnet':
-        return '../../../data/jpk322/FloodNet/'
+        return './dataset/floodnet/'

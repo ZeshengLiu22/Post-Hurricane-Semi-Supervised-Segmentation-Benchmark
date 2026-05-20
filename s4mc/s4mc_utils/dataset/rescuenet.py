@@ -89,7 +89,6 @@ def build_rescueloader(split, all_cfg, seed=0):
     cfg = copy.deepcopy(cfg_dset)
     cfg.update(cfg.get(split, {}))
 
-    workers = cfg.get("workers", 2)
     batch_size = cfg.get("batch_size", 1)
     
     # build transform
@@ -109,10 +108,9 @@ def build_rescueloader(split, all_cfg, seed=0):
     loader = DataLoader(
         dset,
         batch_size=batch_size,
-        num_workers=workers,
         sampler=sample,
         shuffle=False,
-        pin_memory=False,
+        **dataloader_kwargs(cfg, split),
     )
     return loader
 
@@ -122,7 +120,6 @@ def build_rescue_semi_loader(split, all_cfg, seed=0):
     cfg = copy.deepcopy(cfg_dset)
     cfg.update(cfg.get(split, {}))
 
-    workers = cfg.get("workers", 2)
     batch_size = cfg.get("batch_size", 1)
 
     # build transform
@@ -141,10 +138,9 @@ def build_rescue_semi_loader(split, all_cfg, seed=0):
         loader = DataLoader(
             dset,
             batch_size=batch_size,
-            num_workers=workers,
             sampler=sample,
             shuffle=False,
-            pin_memory=True,
+            **dataloader_kwargs(cfg, split),
         )
         return loader
 
@@ -152,7 +148,10 @@ def build_rescue_semi_loader(split, all_cfg, seed=0):
     dset_sup = rescue_dset(cfg["data_root"], cfg["data_list"], trs_form)
     
     # build sampler for unlabeled set
-    data_list_unsup = cfg["data_list"].replace("labeled.txt", "unlabeled.txt")
+    if "labeled-" in cfg["data_list"]:
+        data_list_unsup = cfg["data_list"].replace("labeled-", "unlabeled-")
+    else:
+        data_list_unsup = cfg["data_list"].replace("labeled.txt", "unlabeled.txt")
     dset_unsup = rescue_dset(
             cfg["data_root"], data_list_unsup, trs_form_unsup)
 
@@ -164,11 +163,10 @@ def build_rescue_semi_loader(split, all_cfg, seed=0):
     loader_sup = DataLoader(
             dset_sup,
             batch_size=batch_size,
-            num_workers=workers,
             sampler=sample_sup,
             shuffle=False,
-            pin_memory=True,
             drop_last=True,
+            **dataloader_kwargs(cfg, split),
     )
 
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -178,10 +176,24 @@ def build_rescue_semi_loader(split, all_cfg, seed=0):
     loader_unsup = DataLoader(
             dset_unsup,
             batch_size=batch_size,
-            num_workers=workers,
             sampler=sample_unsup,
             shuffle=False,
-            pin_memory=True,
             drop_last=True,
+            **dataloader_kwargs(cfg, split),
     )
     return loader_sup, loader_unsup
+
+
+def dataloader_kwargs(cfg, split):
+    if split == "val":
+        workers = cfg.get("val_num_workers", cfg.get("val_workers", cfg.get("num_workers", cfg.get("workers", 2))))
+    else:
+        workers = cfg.get("num_workers", cfg.get("workers", 2))
+    kwargs = {
+        "num_workers": workers,
+        "pin_memory": cfg.get("pin_memory", True),
+    }
+    if workers > 0:
+        kwargs["prefetch_factor"] = cfg.get("prefetch_factor", 2)
+        kwargs["persistent_workers"] = cfg.get("persistent_workers", True)
+    return kwargs

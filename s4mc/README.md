@@ -1,104 +1,75 @@
-# Semi-Supervised Semantic Segmentation via Marginal Contextual Information
+# S4MC
 
-![](https://github.com/s4mcontext/s4mc/blob/main/imgs/method.png?raw=true)
+This directory contains the adapted S4MC code used in the post-hurricane semi-supervised segmentation benchmark.
 
-## Description:information_source:
-This is an official PyTorch implementation of the "Semi-Supervised Semantic Segmentation via Marginal Contextual Information" paper submission for NeurIPS 2023.
+Use the root project README for the full benchmark workflow. This file only covers direct S4MC commands.
 
-The method utilize contextual information to produce higher quality and higher quantity of pseudo-labels.
+## Setup
 
+From the repository root:
 
-  * [Description](#description-information_source)
-  * [Results](#results-bar_chart)
-  * [Installation](#Installation-writing_hand)
-  * [Preperation](#Preperation-card_index_dividers)
-  * [Training](#training-weight_lifting)
-  * [License](#License-paperclip:)
-  * [Acknowledgement](#Acknowledgement-copyright)
-  
-  
-  ## Results :bar_chart:
-Results for PASCAL VOC 12, using additional coarse annotated:
+```bash
+python3 tools/prepare_method_datasets.py
+python3 tools/check_pretrained_weights.py
+```
 
-|Method |  1/16  | 1/8 | 1/4 | 1/2 | full | 
-|:--- |:---:|:---:|:---:|:---:|:---:|
-|Sup only|45.77 |54.92 |65.88 |71.69| 72.50|
-|baseline |52.16| 63.47| 69.46| 73.73| 76.54|
-|S4MC + CutMix-Seg     |70.96| 71.6*| 75.41| 77.73| 80.58|
-|S4MC + FixMatch   |**74.32**| **75.62**| **77.84**| **79.72**| **81.51**|
+The setup creates `s4mc/dataset/{FloodNet,RescueNet}/` symlinks, generated split files, generated `config_{dataset}_{split}.yaml` files, and expects `s4mc/resnet101.pth`.
 
-For all the results, please refer to the paper experiment section
+Activate the S4MC environment before running:
 
-A visual example for the results:
-
-![](https://github.com/s4mcontext/s4mc/blob/main/imgs/res.png?raw=true)
-
-## Installation :writing_hand:
-
-> 
-git clone https://github.com/s4mcontext/s4mc.git && cd s4mc
-conda create -n s4mc
+```bash
 conda activate s4mc
-pip install -r requirements.txt
-
-You also need to download a backbone trained on ImageNet-1k by either:
-*  use pretrained pythorch flag and save the path.
-* download from [Google drive link].(https://drive.google.com/file/d/1nzSX8bX3zoRREn6WnoEeAPbKYPPOa-3Y/view?usp=sharing "Google drive link") (credit below)
-
-
-## Preperation :card_index_dividers:
-
-Before training the models please put the datasets in the `data` sub-directory.
-
-For PASCAL VOC 2012:
-follow [this instuction](https://github.com/zhixuanli/segmentation-paper-reading-notes/blob/master/others/Summary%20of%20the%20semantic%20segmentation%20datasets.md "this instuction") and download `PASCAL VOC 2012 augmented with SBD dataset.`
-
-For Cityscapes:
-Download "leftImg8bit_trainvaltest.zip" and "gtFine_trainvaltest.zip" from: https://www.cityscapes-dataset.com/downloads/
-
-unzip all into data with the following structure:
-
-    data
-    ├── cityscapes
-    │   ├── gtFine
-    │   └── leftImg8bit
-    ├── splits
-    │   ├── cityscapes
-    │   └── pascal
-    └── VOC2012
-        ├── Annotations
-        ├── ImageSets
-        ├── JPEGImages
-        ├── SegmentationClass
-        ├── SegmentationClassAug
-        └── SegmentationObject
-
-
-4. Go over the [dependencies](#dependencies-floppy_disk).
-
-## Training :weight_lifting:
-
-For training a semi-supervised model you need to first set a config.
-We've provided an example config for PASCAL. all the splits of data are provided in the data sub-directory as well, so simply change the config with the desired parameters and dataset.
-
-To run the code distributed, go to experiments and run: 
-```
-python -m torch.distributed.launch --nproc_per_node=<#GPUs> --nnodes=1 ../train_semi.py --config=<path_to_config> --seed <random_seed> --name <exp_name>
 ```
 
-where
-`<#GPUs>` is the number of cuda devices avalible for distributed training.
-`<path_to_config>` is the path to your config
-`<random_seed>` to set a random seed for reproducability
-`<exp_name>` will save the model and tensorboard with the experiment name
+## Run All Benchmark Splits
 
-## License :paperclip:
+From the repository root:
 
-This project is released under the [Apache 2.0 ](https://github.com/Haochen-Wang409/U2PL/blob/main/LICENSE "Apache 2.0 ") license.
+```bash
+bash scripts/run_s4mc_benchmark.sh
+```
 
+Useful overrides:
 
+```bash
+RUN_ID=trial1 NUM_GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/run_s4mc_benchmark.sh
+PREP_DATA=0 AMP=true BASE_PORT=29820 bash scripts/run_s4mc_benchmark.sh
+SEED=7 RUN_ID=seed7 bash scripts/run_s4mc_benchmark.sh
+```
 
-## Acknowledgement :copyright:
+## Direct Training
 
-This repository code is heavily based on [U2PL](https://github.com/Haochen-Wang409/U2PL) as well as the link for the pre-trained model provided in here.
+Run from `s4mc/`:
 
+```bash
+cd s4mc
+torchrun --nproc_per_node=4 --master_port=29800 train_semi.py \
+  --config config_rescuenet_25.yaml \
+  --seed 42 \
+  --name rescuenet_25_manual \
+  --amp true \
+  --port 29800
+```
+
+Use `config_floodnet_12_5.yaml`, `config_floodnet_25.yaml`, `config_floodnet_50.yaml`, `config_rescuenet_12_5.yaml`, `config_rescuenet_25.yaml`, or `config_rescuenet_50.yaml`.
+
+## Direct Evaluation
+
+```bash
+cd s4mc
+python eval-rescuenet.py \
+  --config config_rescuenet_25.yaml \
+  --ckpt checkpoints/rescuenet_25_manual/ckpt_best.pth \
+  --save_dir results/eval_rescuenet_25
+
+python eval-floodnet.py \
+  --config config_floodnet_25.yaml \
+  --ckpt checkpoints/floodnet_25_manual/ckpt_best.pth \
+  --save_dir results/eval_floodnet_25
+```
+
+For comparable cross-method metrics, prefer the root `tools/evaluate_semi_supervised_final.py` evaluator.
+
+## Upstream Reference
+
+Original project: <https://github.com/s4mcontext/s4mc>

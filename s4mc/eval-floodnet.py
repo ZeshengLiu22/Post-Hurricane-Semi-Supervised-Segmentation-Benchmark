@@ -9,7 +9,57 @@ from tqdm import tqdm
 
 from s4mc_utils.models.model_helper import ModelBuilder
 from s4mc_utils.dataset.builder import get_loader
-from s4mc_utils.utils.utils import intersectionAndUnion, convert_state_dict
+from s4mc_utils.utils.utils import convert_state_dict
+
+
+def nanmean_or_nan(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(values.mean()) if values.size else float("nan")
+
+
+def nanstd_or_nan(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(values.std(ddof=0)) if values.size else float("nan")
+
+
+def metric_percent(value):
+    value = float(value)
+    return f"{value * 100:.2f}%" if np.isfinite(value) else "nan"
+
+
+def confusion_matrix_from_arrays(pred, target, num_classes, ignore_index=None):
+    pred = np.asarray(pred).reshape(-1).astype(np.int64, copy=False)
+    target = np.asarray(target).reshape(-1).astype(np.int64, copy=False)
+    valid = (target >= 0) & (target < num_classes)
+    valid &= (pred >= 0) & (pred < num_classes)
+    if ignore_index is not None:
+        valid &= target != ignore_index
+    if not np.any(valid):
+        return np.zeros((num_classes, num_classes), dtype=np.int64)
+    bins = target[valid] * num_classes + pred[valid]
+    return np.bincount(bins, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+
+def compute_metrics_from_confusion(confusion):
+    confusion = confusion.astype(np.float64, copy=False)
+    intersection = np.diag(confusion)
+    target_pixels = confusion.sum(axis=1)
+    predicted_pixels = confusion.sum(axis=0)
+    union = target_pixels + predicted_pixels - intersection
+    iou = np.full(confusion.shape[0], np.nan, dtype=np.float64)
+    np.divide(intersection, union, out=iou, where=union > 0)
+    total_target = target_pixels.sum()
+    fwiou = float(np.nansum(target_pixels * iou) / total_target) if total_target > 0 else float("nan")
+    return {
+        "intersection": intersection,
+        "union": union,
+        "target_pixels": target_pixels,
+        "predicted_pixels": predicted_pixels,
+        "iou": iou,
+        "FWIoU": fwiou,
+    }
 
 
 def get_floodnet_palette():
@@ -42,16 +92,14 @@ def save_prediction(mask, name, color_folder, palette):
 def evaluate(model, loader, cfg, save_dir=None):
     model.eval()
     num_classes = cfg["net"]["num_classes"]
-    ignore_label = cfg["dataset"]["ignore_label"]
+    ignore_label = cfg["dataset"].get("ignore_label")
 
     color_dir = os.path.join(save_dir, "color") if save_dir else None
     palette = get_floodnet_palette() if save_dir else None
 
-    inter_meter = np.zeros(num_classes)
-    union_meter = np.zeros(num_classes)
-    target_meter = np.zeros(num_classes)
-
+    total_confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
     per_image_mious = []
+    per_image_mious_no_background = []
 
     for _, (images, labels, names) in enumerate(tqdm(loader)):
         images = images.cuda()
@@ -69,34 +117,50 @@ def evaluate(model, loader, cfg, save_dir=None):
             if save_dir:
                 save_prediction(pred_i, names[i], color_dir, palette)
 
-            inter, union, target = intersectionAndUnion(pred_i, label_i, num_classes, ignore_label)
-            inter_meter += inter
-            union_meter += union
-            target_meter += target
+            per_confusion = confusion_matrix_from_arrays(pred_i, label_i, num_classes, ignore_label)
+            total_confusion += per_confusion
 
-            # Per-image mIoU
-            iou = inter / (union + 1e-10)
-            valid = target > 0
-            per_image_miou = np.mean(iou[valid]) if np.any(valid) else 0.0
-            per_image_mious.append(per_image_miou)
+            per_metrics = compute_metrics_from_confusion(per_confusion)
+            present = per_metrics["target_pixels"] > 0
+            present_no_background = present.copy()
+            if present_no_background.size:
+                present_no_background[0] = False
+            per_image_mious.append(nanmean_or_nan(per_metrics["iou"][present]))
+            per_image_mious_no_background.append(nanmean_or_nan(per_metrics["iou"][present_no_background]))
 
     # Dataset-level metrics
-    iou = inter_meter / (union_meter + 1e-10)
-    acc = inter_meter / (target_meter + 1e-10)
-    miou = np.mean(iou)
-    acc_avg = np.mean(acc)
-    fwiou = (target_meter * iou).sum() / (target_meter.sum() + 1e-10)
+    metrics = compute_metrics_from_confusion(total_confusion)
+    iou = metrics["iou"]
+    acc = np.full(num_classes, np.nan, dtype=np.float64)
+    np.divide(metrics["intersection"], metrics["target_pixels"], out=acc, where=metrics["target_pixels"] > 0)
+    no_background = np.ones(num_classes, dtype=bool)
+    if num_classes:
+        no_background[0] = False
+    miou = nanmean_or_nan(iou)
+    miou_no_background = nanmean_or_nan(iou[no_background])
+    acc_avg = nanmean_or_nan(acc)
 
     print("\n--- Evaluation Results ---")
     for i in range(num_classes):
-        print(f"Class {i:02d} | IoU: {iou[i]*100:.2f}% | Acc: {acc[i]*100:.2f}%")
-    print(f"\nmIoU: {miou*100:.2f}%, Acc: {acc_avg*100:.2f}%, fwIoU: {fwiou*100:.2f}%")
+        print(f"Class {i:02d} | IoU: {metric_percent(iou[i])} | Acc: {metric_percent(acc[i])}")
+    print(
+        f"\nmIoU: {metric_percent(miou)}, "
+        f"mIoU_no_background: {metric_percent(miou_no_background)}, "
+        f"Acc: {metric_percent(acc_avg)}, "
+        f"fwIoU: {metric_percent(metrics['FWIoU'])}"
+    )
 
     # Per-image mIoU statistics
-    per_image_mious = np.array(per_image_mious)
-    print(f"\nPer-image mIoU: {per_image_mious.mean()*100:.2f}% ± {per_image_mious.std()*100:.2f}%")
+    print(
+        f"\nPer-image mIoU: {metric_percent(nanmean_or_nan(per_image_mious))} "
+        f"+/- {metric_percent(nanstd_or_nan(per_image_mious))}"
+    )
+    print(
+        f"Per-image mIoU_no_background: {metric_percent(nanmean_or_nan(per_image_mious_no_background))} "
+        f"+/- {metric_percent(nanstd_or_nan(per_image_mious_no_background))}"
+    )
 
-    return miou, acc_avg, fwiou
+    return miou, acc_avg, metrics["FWIoU"]
 
 
 def main():

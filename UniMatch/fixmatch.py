@@ -25,7 +25,7 @@ parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--labeled-id-path', type=str, required=True)
 parser.add_argument('--unlabeled-id-path', type=str, required=True)
 parser.add_argument('--save-path', type=str, required=True)
-parser.add_argument('--local_rank', default=0, type=int)
+parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
 
@@ -195,7 +195,7 @@ def main():
                                             total_loss_s.avg, total_mask_ratio.avg))
         
         eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
-        mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg)
+        mIoU, iou_class, *_ = evaluate(model, valloader, eval_mode, cfg)
 
         if rank == 0:
             for (cls_idx, iou) in enumerate(iou_class):

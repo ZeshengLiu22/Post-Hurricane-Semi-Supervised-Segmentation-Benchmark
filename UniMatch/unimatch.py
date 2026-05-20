@@ -25,8 +25,26 @@ parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--labeled-id-path', type=str, required=True)
 parser.add_argument('--unlabeled-id-path', type=str, required=True)
 parser.add_argument('--save-path', type=str, required=True)
-parser.add_argument('--local_rank', default=0, type=int)
+parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
+
+
+def get_amp_dtype(cfg):
+    dtype = str(cfg.get('amp_dtype', 'bfloat16')).lower()
+    if dtype in ('bf16', 'bfloat16'):
+        return torch.bfloat16
+    if dtype in ('fp16', 'float16', 'half'):
+        return torch.float16
+    raise ValueError('Unsupported amp_dtype: %s' % cfg.get('amp_dtype'))
+
+
+def dataloader_kwargs(num_workers, cfg):
+    kwargs = {'pin_memory': bool(cfg.get('pin_memory', True)), 'num_workers': num_workers}
+    if num_workers > 0:
+        kwargs['prefetch_factor'] = int(cfg.get('prefetch_factor', 2))
+        if bool(cfg.get('persistent_workers', False)):
+            kwargs['persistent_workers'] = True
+    return kwargs
 
 
 def main():
@@ -49,6 +67,8 @@ def main():
     
     cudnn.enabled = True
     cudnn.benchmark = True
+    cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = True
 
     model = DeepLabV3Plus(cfg)
     optimizer = SGD([{'params': model.backbone.parameters(), 'lr': cfg['lr']},
@@ -73,6 +93,12 @@ def main():
         raise NotImplementedError('%s criterion is not implemented' % cfg['criterion']['name'])
 
     criterion_u = nn.CrossEntropyLoss(reduction='none').cuda(local_rank)
+    amp_enabled = bool(cfg.get('amp', False))
+    amp_dtype = get_amp_dtype(cfg)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
+
+    if rank == 0 and amp_enabled:
+        logger.info('AMP enabled with dtype: %s\n' % str(amp_dtype).replace('torch.', ''))
 
     trainset_u = SemiDataset(cfg['dataset'], cfg['data_root'], 'train_u',
                              cfg['crop_size'], args.unlabeled_id_path)
@@ -81,16 +107,25 @@ def main():
     valset = SemiDataset(cfg['dataset'], cfg['data_root'], 'val')
 
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
+    num_workers = int(cfg.get('num_workers', 4))
+    val_num_workers = int(cfg.get('val_num_workers', num_workers))
+    train_loader_kwargs = dataloader_kwargs(num_workers, cfg)
+    val_loader_kwargs = dataloader_kwargs(val_num_workers, cfg)
     trainloader_l = DataLoader(trainset_l, batch_size=cfg['batch_size'],
-                               pin_memory=True, num_workers=1, drop_last=True, sampler=trainsampler_l)
+                               drop_last=True, sampler=trainsampler_l, **train_loader_kwargs)
     trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
     trainloader_u = DataLoader(trainset_u, batch_size=cfg['batch_size'],
-                               pin_memory=True, num_workers=1, drop_last=True, sampler=trainsampler_u)
+                               drop_last=True, sampler=trainsampler_u, **train_loader_kwargs)
+    trainsampler_u_mix = torch.utils.data.distributed.DistributedSampler(trainset_u)
+    trainloader_u_mix = DataLoader(trainset_u, batch_size=cfg['batch_size'],
+                                   drop_last=True, sampler=trainsampler_u_mix, **train_loader_kwargs)
     valsampler = torch.utils.data.distributed.DistributedSampler(valset)
-    valloader = DataLoader(valset, batch_size=1, pin_memory=True, num_workers=1,
-                           drop_last=False, sampler=valsampler)
+    valloader = DataLoader(valset, batch_size=cfg.get('val_batch_size', 1),
+                           drop_last=False, sampler=valsampler, **val_loader_kwargs)
 
     total_iters = len(trainloader_u) * cfg['epochs']
+    log_interval = max(1, len(trainloader_u) // 8)
+    eval_interval = max(1, int(cfg.get('eval_interval', 1)))
     previous_best = 0.0
     epoch = -1
     
@@ -117,26 +152,32 @@ def main():
 
         trainloader_l.sampler.set_epoch(epoch)
         trainloader_u.sampler.set_epoch(epoch)
+        trainloader_u_mix.sampler.set_epoch(epoch)
 
-        loader = zip(trainloader_l, trainloader_u, trainloader_u)
+        loader = zip(trainloader_l, trainloader_u, trainloader_u_mix)
 
         for i, ((img_x, mask_x),
                 (img_u_w, img_u_s1, img_u_s2, ignore_mask, cutmix_box1, cutmix_box2),
                 (img_u_w_mix, img_u_s1_mix, img_u_s2_mix, ignore_mask_mix, _, _)) in enumerate(loader):
             
-            img_x, mask_x = img_x.cuda(), mask_x.cuda()
-            img_u_w = img_u_w.cuda()
-            img_u_s1, img_u_s2, ignore_mask = img_u_s1.cuda(), img_u_s2.cuda(), ignore_mask.cuda()
-            cutmix_box1, cutmix_box2 = cutmix_box1.cuda(), cutmix_box2.cuda()
-            img_u_w_mix = img_u_w_mix.cuda()
-            img_u_s1_mix, img_u_s2_mix = img_u_s1_mix.cuda(), img_u_s2_mix.cuda()
-            ignore_mask_mix = ignore_mask_mix.cuda()
+            img_x, mask_x = img_x.cuda(non_blocking=True), mask_x.cuda(non_blocking=True)
+            img_u_w = img_u_w.cuda(non_blocking=True)
+            img_u_s1 = img_u_s1.cuda(non_blocking=True)
+            img_u_s2 = img_u_s2.cuda(non_blocking=True)
+            ignore_mask = ignore_mask.cuda(non_blocking=True)
+            cutmix_box1 = cutmix_box1.cuda(non_blocking=True)
+            cutmix_box2 = cutmix_box2.cuda(non_blocking=True)
+            img_u_w_mix = img_u_w_mix.cuda(non_blocking=True)
+            img_u_s1_mix = img_u_s1_mix.cuda(non_blocking=True)
+            img_u_s2_mix = img_u_s2_mix.cuda(non_blocking=True)
+            ignore_mask_mix = ignore_mask_mix.cuda(non_blocking=True)
 
             with torch.no_grad():
                 model.eval()
 
-                pred_u_w_mix = model(img_u_w_mix).detach()
-                conf_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)[0]
+                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    pred_u_w_mix = model(img_u_w_mix).detach()
+                conf_u_w_mix = pred_u_w_mix.softmax(dim=1).max(dim=1)[0].float()
                 mask_u_w_mix = pred_u_w_mix.argmax(dim=1)
 
             img_u_s1[cutmix_box1.unsqueeze(1).expand(img_u_s1.shape) == 1] = \
@@ -148,50 +189,54 @@ def main():
 
             num_lb, num_ulb = img_x.shape[0], img_u_w.shape[0]
 
-            preds, preds_fp = model(torch.cat((img_x, img_u_w)), True)
-            pred_x, pred_u_w = preds.split([num_lb, num_ulb])
-            pred_u_w_fp = preds_fp[num_lb:]
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                preds, preds_fp = model(torch.cat((img_x, img_u_w)), True)
+                pred_x, pred_u_w = preds.split([num_lb, num_ulb])
+                pred_u_w_fp = preds_fp[num_lb:]
 
-            pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2))).chunk(2)
+                pred_u_s1, pred_u_s2 = model(torch.cat((img_u_s1, img_u_s2))).chunk(2)
 
-            pred_u_w = pred_u_w.detach()
-            conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0]
-            mask_u_w = pred_u_w.argmax(dim=1)
+                pred_u_w = pred_u_w.detach()
+                conf_u_w = pred_u_w.softmax(dim=1).max(dim=1)[0].float()
+                mask_u_w = pred_u_w.argmax(dim=1)
 
-            mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = \
-                mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
-            mask_u_w_cutmixed2, conf_u_w_cutmixed2, ignore_mask_cutmixed2 = \
-                mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
+                mask_u_w_cutmixed1, conf_u_w_cutmixed1, ignore_mask_cutmixed1 = \
+                    mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
+                mask_u_w_cutmixed2, conf_u_w_cutmixed2, ignore_mask_cutmixed2 = \
+                    mask_u_w.clone(), conf_u_w.clone(), ignore_mask.clone()
 
-            mask_u_w_cutmixed1[cutmix_box1 == 1] = mask_u_w_mix[cutmix_box1 == 1]
-            conf_u_w_cutmixed1[cutmix_box1 == 1] = conf_u_w_mix[cutmix_box1 == 1]
-            ignore_mask_cutmixed1[cutmix_box1 == 1] = ignore_mask_mix[cutmix_box1 == 1]
+                mask_u_w_cutmixed1[cutmix_box1 == 1] = mask_u_w_mix[cutmix_box1 == 1]
+                conf_u_w_cutmixed1[cutmix_box1 == 1] = conf_u_w_mix[cutmix_box1 == 1]
+                ignore_mask_cutmixed1[cutmix_box1 == 1] = ignore_mask_mix[cutmix_box1 == 1]
 
-            mask_u_w_cutmixed2[cutmix_box2 == 1] = mask_u_w_mix[cutmix_box2 == 1]
-            conf_u_w_cutmixed2[cutmix_box2 == 1] = conf_u_w_mix[cutmix_box2 == 1]
-            ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask_mix[cutmix_box2 == 1]
+                mask_u_w_cutmixed2[cutmix_box2 == 1] = mask_u_w_mix[cutmix_box2 == 1]
+                conf_u_w_cutmixed2[cutmix_box2 == 1] = conf_u_w_mix[cutmix_box2 == 1]
+                ignore_mask_cutmixed2[cutmix_box2 == 1] = ignore_mask_mix[cutmix_box2 == 1]
 
-            loss_x = criterion_l(pred_x, mask_x)
+                loss_x = criterion_l(pred_x, mask_x)
 
-            loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
-            loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= cfg['conf_thresh']) & (ignore_mask_cutmixed1 != 255))
-            loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
+                loss_u_s1 = criterion_u(pred_u_s1, mask_u_w_cutmixed1)
+                loss_u_s1 = loss_u_s1 * ((conf_u_w_cutmixed1 >= cfg['conf_thresh']) & (ignore_mask_cutmixed1 != 255))
+                loss_u_s1 = loss_u_s1.sum() / (ignore_mask_cutmixed1 != 255).sum().item()
 
-            loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
-            loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255))
-            loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
+                loss_u_s2 = criterion_u(pred_u_s2, mask_u_w_cutmixed2)
+                loss_u_s2 = loss_u_s2 * ((conf_u_w_cutmixed2 >= cfg['conf_thresh']) & (ignore_mask_cutmixed2 != 255))
+                loss_u_s2 = loss_u_s2.sum() / (ignore_mask_cutmixed2 != 255).sum().item()
 
-            loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
-            loss_u_w_fp = loss_u_w_fp * ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255))
-            loss_u_w_fp = loss_u_w_fp.sum() / (ignore_mask != 255).sum().item()
+                loss_u_w_fp = criterion_u(pred_u_w_fp, mask_u_w)
+                loss_u_w_fp = loss_u_w_fp * ((conf_u_w >= cfg['conf_thresh']) & (ignore_mask != 255))
+                loss_u_w_fp = loss_u_w_fp.sum() / (ignore_mask != 255).sum().item()
 
-            loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0
+                loss = (loss_x + loss_u_s1 * 0.25 + loss_u_s2 * 0.25 + loss_u_w_fp * 0.5) / 2.0
 
-            torch.distributed.barrier()
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
 
             total_loss.update(loss.item())
             total_loss_x.update(loss_x.item())
@@ -214,26 +259,32 @@ def main():
                 writer.add_scalar('train/loss_w_fp', loss_u_w_fp.item(), iters)
                 writer.add_scalar('train/mask_ratio', mask_ratio, iters)
             
-            if (i % (len(trainloader_u) // 8) == 0) and (rank == 0):
+            if (i % log_interval == 0) and (rank == 0):
                 logger.info('Iters: {:}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Loss w_fp: {:.3f}, Mask ratio: '
                             '{:.3f}'.format(i, total_loss.avg, total_loss_x.avg, total_loss_s.avg,
                                             total_loss_w_fp.avg, total_mask_ratio.avg))
 
-        eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
-        mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg)
+        do_eval = ((epoch + 1) % eval_interval == 0) or (epoch + 1 == cfg['epochs'])
+        if do_eval:
+            eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
+            mIoU, iou_class, *_ = evaluate(model, valloader, eval_mode, cfg)
 
-        if rank == 0:
-            for (cls_idx, iou) in enumerate(iou_class):
-                logger.info('***** Evaluation ***** >>>> Class [{:} {:}] '
-                            'IoU: {:.2f}'.format(cls_idx, CLASSES[0][cfg['dataset']][cls_idx], iou))
-            logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n'.format(eval_mode, mIoU))
-            
-            writer.add_scalar('eval/mIoU', mIoU, epoch)
-            for i, iou in enumerate(iou_class):
-                writer.add_scalar('eval/%s_IoU' % (CLASSES[0][cfg['dataset']][i]), iou, epoch)
+            if rank == 0:
+                for (cls_idx, iou) in enumerate(iou_class):
+                    logger.info('***** Evaluation ***** >>>> Class [{:} {:}] '
+                                'IoU: {:.2f}'.format(cls_idx, CLASSES[0][cfg['dataset']][cls_idx], iou))
+                logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n'.format(eval_mode, mIoU))
 
-        is_best = mIoU > previous_best
-        previous_best = max(mIoU, previous_best)
+                writer.add_scalar('eval/mIoU', mIoU, epoch)
+                for i, iou in enumerate(iou_class):
+                    writer.add_scalar('eval/%s_IoU' % (CLASSES[0][cfg['dataset']][i]), iou, epoch)
+
+            is_best = mIoU > previous_best
+            previous_best = max(mIoU, previous_best)
+        else:
+            is_best = False
+            if rank == 0:
+                logger.info('Skip evaluation at epoch {:}; next eval interval: {:}\n'.format(epoch, eval_interval))
         if rank == 0:
             checkpoint = {
                 'model': model.state_dict(),

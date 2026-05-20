@@ -1,0 +1,63 @@
+# Python bytecode and local caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Local run artifacts
+/benchmark_runs/
+/demo_runs/
+/run_logs/
+/results/
+*.log
+events.out.tfevents*
+
+# Method-local datasets, symlinks, generated split mirrors, and outputs
+/UniMatch/dataset/floodnet/
+/UniMatch/dataset/rescuenet/
+/UniMatch/exp/
+/UniMatch/splits/floodnet/12_5/
+/UniMatch/splits/floodnet/25/
+/UniMatch/splits/floodnet/50/
+/UniMatch/splits/rescuenet/12_5/
+/UniMatch/splits/rescuenet/25/
+/UniMatch/splits/rescuenet/50/
+
+/ClassMix/checkpoints/
+/ClassMix/dataset/
+/ClassMix/data/floodnet/splits/
+/ClassMix/data/rescuenet/splits/
+
+/reco/dataset/
+/reco/outputs/
+/reco/results/
+
+/s4mc/checkpoints/
+/s4mc/dataset/
+/s4mc/log/
+/s4mc/results/
+
+/dual_teacher/data/
+/dual_teacher/logs/
+/dual_teacher/predictions/
+/dual_teacher/work_dirs/
+
+# Pretrained weights and checkpoints
+/Pretrain_Weights/
+*.pth
+*.pt
+*.ckpt
+
+# Required benchmark backbones are committed with Git LFS.
+!/UniMatch/pretrained/
+!/UniMatch/pretrained/resnet101.pth
+!/ClassMix/pretrained/
+!/ClassMix/pretrained/resnet101COCO-41f33a49.pth
+!/dual_teacher/pretrained/
+!/dual_teacher/pretrained/mit_b1.pth
+!/s4mc/resnet101.pth
+
+# Retired local helper scripts; keep current benchmark helpers in /tools tracked.
+/tools/benchmark_model_loader_settings.py
+/tools/benchmark_unimatch_loader_settings.py
+/tools/run_final_demo_sweep.py

@@ -1,6 +1,5 @@
 from .builder import DATASETS
 from .custom import CustomDataset
-from IPython import embed
 
 @DATASETS.register_module()
 class CocoStuff(CustomDataset):

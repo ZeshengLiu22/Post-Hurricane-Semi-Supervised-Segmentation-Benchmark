@@ -16,6 +16,7 @@ def setup_distributed(backend="nccl", port=None):
     Lifted from https://github.com/BIGBALLON/distribuuuu/blob/master/distribuuuu/utils.py
     Originally licensed MIT, Copyright (c) 2020 Wei Li
     """
+    backend = os.environ.get("DIST_BACKEND", backend)
     num_gpus = torch.cuda.device_count()
 
     if "SLURM_JOB_ID" in os.environ:

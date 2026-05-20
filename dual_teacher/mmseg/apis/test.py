@@ -9,7 +9,6 @@ import torch
 import torch.distributed as dist
 from mmcv.image import tensor2imgs
 from mmcv.runner import get_dist_info
-from IPython import embed
 from mmseg.ops import resize
 
 def np2tmp(array, temp_file_name=None):

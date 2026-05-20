@@ -93,9 +93,9 @@ def compute_reco_loss(rep, label, mask, prob, strong_threshold=1.0, temp=0.5, nu
 
     # compute regional contrastive loss
     if len(seg_num_list) <= 1:  # in some rare cases, a small mini-batch might only contain 1 or no semantic class
-        return torch.tensor(0.0)
+        return rep.new_tensor(0.0)
     else:
-        reco_loss = torch.tensor(0.0)
+        reco_loss = rep.new_tensor(0.0)
         seg_proto = torch.cat(seg_proto_list)
         valid_seg = len(seg_num_list)
         seg_len = torch.arange(valid_seg)
@@ -275,4 +275,3 @@ def generate_unsup_data(data, target, logits, mode='cutout'):
 
     new_data, new_target, new_logits = torch.cat(new_data), torch.cat(new_target), torch.cat(new_logits)
     return new_data, new_target.long(), new_logits
-

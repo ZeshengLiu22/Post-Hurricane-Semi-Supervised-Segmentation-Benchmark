@@ -41,12 +41,14 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--port", default=None, type=int)
 parser.add_argument("--name", default="regular")
 parser.add_argument("--mode", type=str, default="train")
+parser.add_argument("--amp", type=lambda x: str(x).lower() in ("1", "true", "yes", "y"), default=True)
 
 def main():
     global args, cfg, prototype
     args = parser.parse_args()
     seed = args.seed
     cfg = yaml.load(open(args.config, "r"), Loader=yaml.Loader)
+    cfg["trainer"]["amp"] = args.amp
     
     logger = init_log("global", logging.INFO)
     logger.propagate = 0
@@ -265,6 +267,8 @@ def train(
 ):
     global prototype
     ema_decay_origin = cfg["net"]["ema_decay"]
+    amp_enabled = cfg["trainer"].get("amp", True) and torch.cuda.is_available()
+    amp_dtype = torch.bfloat16
     model.train()
 
     loader_l.sampler.set_epoch(epoch)
@@ -283,7 +287,7 @@ def train(
 
 
     batch_end = time.time()
-    for step in range(1): #len(loader_l)):
+    for step in range(len(loader_l)):
         batch_start = time.time()
 
         i_iter = epoch * len(loader_l) + step
@@ -295,29 +299,34 @@ def train(
         batch_size, h, w = label_l.size()
         image_l, label_l = image_l.cuda(), label_l.cuda()
 
-        image_u, _ = next(loader_u_iter)
+        try:
+            image_u, _ = next(loader_u_iter)
+        except StopIteration:
+            loader_u_iter = iter(loader_u)
+            image_u, _ = next(loader_u_iter)
         image_u = image_u.cuda()
         
         if epoch < cfg["trainer"].get("sup_only_epoch", 1):
             contra_flag = "none"
             # forward
-            outs = model(image_l)
-            pred, rep = outs["pred"], outs["rep"]
-            pred = F.interpolate(pred, (h, w), mode="bilinear", align_corners=True)
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                outs = model(image_l)
+                pred, rep = outs["pred"], outs["rep"]
+                pred = F.interpolate(pred, (h, w), mode="bilinear", align_corners=True)
 
-            # supervised loss
-            if "aux_loss" in cfg["net"].keys():
-                aux = outs["aux"]
-                aux = F.interpolate(aux, (h, w), mode="bilinear", align_corners=True)
-                sup_loss = sup_loss_fn([pred, aux], label_l)
-            else:
-                sup_loss = sup_loss_fn(pred, label_l)
+                # supervised loss
+                if "aux_loss" in cfg["net"].keys():
+                    aux = outs["aux"]
+                    aux = F.interpolate(aux, (h, w), mode="bilinear", align_corners=True)
+                    sup_loss = sup_loss_fn([pred, aux], label_l)
+                else:
+                    sup_loss = sup_loss_fn(pred, label_l)
 
-            model_teacher.train()
-            _ = model_teacher(image_l)
+                model_teacher.train()
+                _ = model_teacher(image_l)
 
-            unsup_loss = 0 * rep.sum()
-            contra_loss = 0 * rep.sum()
+                unsup_loss = 0 * rep.sum()
+                contra_loss = 0 * rep.sum()
         else:
             if epoch == cfg["trainer"].get("sup_only_epoch", 1):
                 # copy student parameters to teacher
@@ -329,12 +338,14 @@ def train(
 
             # generate pseudo labels first
             model_teacher.eval()
-            pred_u_teacher = model_teacher(image_u)["pred"]
-            pred_u_teacher = F.interpolate(
-                pred_u_teacher, (h, w), mode="bilinear", align_corners=True
-            )
-            pred_u_teacher = F.softmax(pred_u_teacher, dim=1)
-            logits_u_aug, label_u_aug = torch.max(pred_u_teacher, dim=1)
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    pred_u_teacher = model_teacher(image_u)["pred"]
+                    pred_u_teacher = F.interpolate(
+                        pred_u_teacher, (h, w), mode="bilinear", align_corners=True
+                    )
+                    pred_u_teacher = F.softmax(pred_u_teacher, dim=1)
+                    logits_u_aug, label_u_aug = torch.max(pred_u_teacher, dim=1)
 
             # apply strong data augmentation: cutout, cutmix, or classmix
             if np.random.uniform(0, 1) < 0.5 and cfg["trainer"]["unsupervised"].get(
@@ -352,40 +363,42 @@ def train(
             # forward
             num_labeled = len(image_l)
             image_all = torch.cat((image_l, image_u_aug))
-            outs = model(image_all)
-            pred_all, rep_all = outs["pred"], outs["rep"]
-            pred_l, pred_u = pred_all[:num_labeled], pred_all[num_labeled:]
-            pred_l_large = F.interpolate(
-                pred_l, size=(h, w), mode="bilinear", align_corners=True
-            )
-            pred_u_large = F.interpolate(
-                pred_u, size=(h, w), mode="bilinear", align_corners=True
-            )
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                outs = model(image_all)
+                pred_all, rep_all = outs["pred"], outs["rep"]
+                pred_l, pred_u = pred_all[:num_labeled], pred_all[num_labeled:]
+                pred_l_large = F.interpolate(
+                    pred_l, size=(h, w), mode="bilinear", align_corners=True
+                )
+                pred_u_large = F.interpolate(
+                    pred_u, size=(h, w), mode="bilinear", align_corners=True
+                )
 
 
-            # supervised loss
-            if "aux_loss" in cfg["net"].keys():
-                aux = outs["aux"][:num_labeled]
-                aux = F.interpolate(aux, (h, w), mode="bilinear", align_corners=True)
-                sup_loss = sup_loss_fn([pred_l_large, aux], label_l.clone())
-            else:
-                sup_loss = sup_loss_fn(pred_l_large, label_l.clone())
+                # supervised loss
+                if "aux_loss" in cfg["net"].keys():
+                    aux = outs["aux"][:num_labeled]
+                    aux = F.interpolate(aux, (h, w), mode="bilinear", align_corners=True)
+                    sup_loss = sup_loss_fn([pred_l_large, aux], label_l.clone())
+                else:
+                    sup_loss = sup_loss_fn(pred_l_large, label_l.clone())
 
             # teacher forward
             model_teacher.train()
             with torch.no_grad():
-                out_t = model_teacher(image_all)
-                pred_all_teacher, rep_all_teacher = out_t["pred"], out_t["rep"]
-                prob_all_teacher = F.softmax(pred_all_teacher, dim=1)
-                prob_l_teacher, prob_u_teacher = (
-                    prob_all_teacher[:num_labeled],
-                    prob_all_teacher[num_labeled:],
-                )
-                
-                pred_u_teacher = pred_all_teacher[num_labeled:]
-                pred_u_large_teacher = F.interpolate(
-                    pred_u_teacher, size=(h, w), mode="bilinear", align_corners=True
-                )
+                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    out_t = model_teacher(image_all)
+                    pred_all_teacher, rep_all_teacher = out_t["pred"], out_t["rep"]
+                    prob_all_teacher = F.softmax(pred_all_teacher, dim=1)
+                    prob_l_teacher, prob_u_teacher = (
+                        prob_all_teacher[:num_labeled],
+                        prob_all_teacher[num_labeled:],
+                    )
+
+                    pred_u_teacher = pred_all_teacher[num_labeled:]
+                    pred_u_large_teacher = F.interpolate(
+                        pred_u_teacher, size=(h, w), mode="bilinear", align_corners=True
+                    )
 
             # unsupervised loss
             drop_percent = cfg["trainer"]["unsupervised"].get("drop_percent", 100)
@@ -396,15 +409,16 @@ def train(
             n_neigbors = cfg["trainer"]["unsupervised"].get("n_neigbors", 1)
             ds = "pascal" if "pascal" in cfg["dataset"]["type"] else "cityscapes"
 
-            unsup_loss = compute_unsupervised_loss(
-                        pred_u_large,
-                        label_u_aug.clone(),
-                        drop_percent,
-                        pred_u_large_teacher.detach(),
-                        indicator,
-                        ds,
-                        neigborhood_size,
-                        n_neigbors) * cfg["trainer"]["unsupervised"].get("unsup_weight", 1) * B_ratio
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                unsup_loss = compute_unsupervised_loss(
+                            pred_u_large,
+                            label_u_aug.clone(),
+                            drop_percent,
+                            pred_u_large_teacher.detach(),
+                            indicator,
+                            ds,
+                            neigborhood_size,
+                            n_neigbors) * cfg["trainer"]["unsupervised"].get("unsup_weight", 1) * B_ratio
             
             
 
@@ -422,18 +436,14 @@ def train(
                 with torch.no_grad():
                     prob = torch.softmax(pred_u_large_teacher, dim=1)
                     entropy = -torch.sum(prob * torch.log(prob + 1e-10), dim=1)
+                    valid_entropy = entropy[label_u_aug != 255].float()
 
-                    low_thresh = np.percentile(
-                        entropy[label_u_aug != 255].cpu().numpy().flatten(), alpha_t
-                    )
+                    low_thresh = torch.quantile(valid_entropy, alpha_t / 100.0) if valid_entropy.numel() > 0 else entropy.new_tensor(0.0)
                     low_entropy_mask = (
                         entropy.le(low_thresh).float() * (label_u_aug != 255).bool()
                     )
 
-                    high_thresh = np.percentile(
-                        entropy[label_u_aug != 255].cpu().numpy().flatten(),
-                        100 - alpha_t,
-                    )
+                    high_thresh = torch.quantile(valid_entropy, (100 - alpha_t) / 100.0) if valid_entropy.numel() > 0 else entropy.new_tensor(0.0)
                     high_entropy_mask = (
                         entropy.ge(high_thresh).float() * (label_u_aug != 255).bool()
                     )
@@ -461,14 +471,11 @@ def train(
                     else:
                         contra_flag += " low"
                         high_mask_all = torch.cat(
-                            (
-                                (label_l.unsqueeze(1) != 255).float(),
-                                torch.ones(logits_u_aug.shape)
-                                .float()
-                                .unsqueeze(1)
-                                .cuda(),
-                            ),
-                        )
+	                            (
+	                                (label_l.unsqueeze(1) != 255).float(),
+	                                torch.ones_like(logits_u_aug).unsqueeze(1),
+	                            ),
+	                        )
                     high_mask_all = F.interpolate(
                         high_mask_all, size=pred_all.shape[2:], mode="nearest"
                     )  # down sample

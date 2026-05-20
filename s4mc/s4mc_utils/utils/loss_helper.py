@@ -7,6 +7,13 @@ from torch.nn import functional as F
 from .utils import dequeue_and_enqueue
 
 
+def _quantile_or_zero(values, q, like):
+    values = values.float()
+    if values.numel() == 0:
+        return like.new_tensor(0.0)
+    return torch.quantile(values, q)
+
+
 def compute_rce_loss(predict, target):
     from einops import rearrange
 
@@ -103,18 +110,16 @@ def compute_unsupervised_loss(predict, target, percent, pred_teacher,indicator='
         
         if indicator=='entropy':
             entropy = -torch.sum(prob * torch.log(prob + 1e-10), dim=1) #shape: batch_size, h, w
-            thresh = np.percentile(
-                entropy[target != 255].detach().cpu().numpy().flatten(), percent)
+            thresh = _quantile_or_zero(entropy[target != 255], percent / 100.0, prob)
             
         elif indicator=='confidence':
             _max_probs, max_class = torch.max(prob, dim=1) #shape: batch_size, h, w
 
-            thresh = np.percentile(
-                _max_probs[target != 255].detach().cpu().numpy().flatten(), 100-percent)
+            thresh = _quantile_or_zero(_max_probs[target != 255], (100 - percent) / 100.0, prob)
         else: #margin
             _topk,_=torch.topk(prob, 2, dim=1)
             _margin = _topk[:,0,:,:] - _topk[:,1,:,:] #shape: batch_size, h, w
-            thresh = np.percentile(_margin[target != 255].detach().cpu().numpy().flatten(), 100-percent)
+            thresh = _quantile_or_zero(_margin[target != 255], (100 - percent) / 100.0, prob)
 
         E= torch.tensor(E_joint).view((1, num_class, 1, 1)).to(prob.device)
         """
@@ -129,7 +134,7 @@ def compute_unsupervised_loss(predict, target, percent, pred_teacher,indicator='
         neighbors=torch.stack(get_neigbor_tensors(prob,n=neigborhood_size,entrophy=False))
         k_neighbors,neigbor_idx=torch.topk(neighbors, k=n_neigbors,axis=0)
         for neighbor in k_neighbors:
-            beta = torch.exp(torch.tensor(-1/2)) #for more neigbors use neigbor_idx
+            beta = prob.new_tensor(-0.5).exp() #for more neigbors use neigbor_idx
             prob = prob + beta*neighbor - (torch.max(prob*neighbor,prob*E)*beta)
                 
 

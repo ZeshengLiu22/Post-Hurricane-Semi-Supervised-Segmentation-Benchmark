@@ -9,6 +9,7 @@ from PIL import ImageFilter
 import pandas as pd
 import numpy as np
 import torch
+import torch.nn.functional as F
 import os
 import random
 import glob
@@ -88,23 +89,97 @@ def transform(image, label, logits=None, crop_size=(512, 512), scale_size=(0.8, 
         return image, label
 
 
+def _normalize_tensor(image):
+    mean = image.new_tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = image.new_tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    return (image - mean) / std
+
+
+def _denormalize_tensor(image):
+    mean = image.new_tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = image.new_tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    return image * std + mean
+
+
+def _resize_image_tensor(image, size):
+    return F.interpolate(image.unsqueeze(0), size=size, mode='bilinear', align_corners=False).squeeze(0)
+
+
+def _resize_map_tensor(value, size, dtype):
+    value = F.interpolate(value.unsqueeze(0).unsqueeze(0).float(), size=size, mode='nearest').squeeze(0).squeeze(0)
+    return value.to(dtype)
+
+
+def _pad_tensor_sample(image, label, logits, crop_size):
+    pad_h = max(crop_size[0] - image.shape[-2], 0)
+    pad_w = max(crop_size[1] - image.shape[-1], 0)
+    if pad_h == 0 and pad_w == 0:
+        return image, label, logits
+
+    pad = (0, pad_w, 0, pad_h)
+    pad_mode = 'reflect' if image.shape[-2] > pad_h and image.shape[-1] > pad_w else 'replicate'
+    image = F.pad(image.unsqueeze(0), pad, mode=pad_mode).squeeze(0)
+    label = F.pad(label.unsqueeze(0).unsqueeze(0), pad, value=-1).squeeze(0).squeeze(0)
+    logits = F.pad(logits.unsqueeze(0).unsqueeze(0), pad, value=0).squeeze(0).squeeze(0)
+    return image, label, logits
+
+
+def _apply_tensor_augmentation(image, label, logits):
+    image = _denormalize_tensor(image).clamp_(0.0, 1.0)
+
+    if torch.rand((), device=image.device) > 0.2:
+        image = transforms_f.adjust_brightness(image, random.uniform(0.75, 1.25))
+        image = transforms_f.adjust_contrast(image, random.uniform(0.75, 1.25))
+        image = transforms_f.adjust_saturation(image, random.uniform(0.75, 1.25))
+        image = transforms_f.adjust_hue(image, random.uniform(-0.25, 0.25))
+
+    if torch.rand((), device=image.device) > 0.5:
+        sigma = random.uniform(0.15, 1.15)
+        image = transforms_f.gaussian_blur(image, kernel_size=[5, 5], sigma=[sigma, sigma])
+
+    if torch.rand((), device=image.device) > 0.5:
+        image = transforms_f.hflip(image)
+        label = transforms_f.hflip(label)
+        logits = transforms_f.hflip(logits)
+
+    return _normalize_tensor(image.clamp_(0.0, 1.0)), label, logits
+
+
 def batch_transform(data, label, logits, crop_size, scale_size, apply_augmentation):
     data_list, label_list, logits_list = [], [], []
-    device = data.device
 
     for k in range(data.shape[0]):
-        data_pil, label_pil, logits_pil = tensor_to_pil(data[k], label[k], logits[k])
-        aug_data, aug_label, aug_logits = transform(data_pil, label_pil, logits_pil,
-                                                    crop_size=crop_size,
-                                                    scale_size=scale_size,
-                                                    augmentation=apply_augmentation)
-        data_list.append(aug_data.unsqueeze(0))
-        label_list.append(aug_label)
-        logits_list.append(aug_logits)
+        image = data[k]
+        sample_label = label[k]
+        sample_logits = logits[k]
+        raw_h, raw_w = image.shape[-2:]
 
-    data_trans, label_trans, logits_trans = \
-        torch.cat(data_list).to(device), torch.cat(label_list).to(device), torch.cat(logits_list).to(device)
-    return data_trans, label_trans, logits_trans
+        scale_ratio = random.uniform(scale_size[0], scale_size[1])
+        resized_size = (max(1, int(raw_h * scale_ratio)), max(1, int(raw_w * scale_ratio)))
+        image = _resize_image_tensor(image, resized_size)
+        sample_label = _resize_map_tensor(sample_label, resized_size, sample_label.dtype)
+        sample_logits = _resize_map_tensor(sample_logits, resized_size, sample_logits.dtype)
+
+        sample_crop_size = crop_size if crop_size != -1 else (raw_h, raw_w)
+        image, sample_label, sample_logits = _pad_tensor_sample(image, sample_label, sample_logits, sample_crop_size)
+
+        max_i = image.shape[-2] - sample_crop_size[0]
+        max_j = image.shape[-1] - sample_crop_size[1]
+        i = random.randint(0, max_i) if max_i > 0 else 0
+        j = random.randint(0, max_j) if max_j > 0 else 0
+        h, w = sample_crop_size
+        image = image[:, i:i + h, j:j + w]
+        sample_label = sample_label[i:i + h, j:j + w]
+        sample_logits = sample_logits[i:i + h, j:j + w]
+
+        if apply_augmentation:
+            image, sample_label, sample_logits = _apply_tensor_augmentation(image, sample_label, sample_logits)
+
+        data_list.append(image.unsqueeze(0))
+        label_list.append(sample_label.unsqueeze(0))
+        logits_list.append(sample_logits.unsqueeze(0))
+
+    return torch.cat(data_list), torch.cat(label_list), torch.cat(logits_list)
 
 
 # --------------------------------------------------------------------------------
@@ -285,7 +360,7 @@ def get_sun_idx(root, train=True, label_num=5):
     else:
         return idx_list
 
-def get_rescuenet_idx(root, train=True, label_num=900):
+def get_rescuenet_idx(root, train=True, label_num=900, split=None):
     root = os.path.expanduser(root)
 
     # Load validation/test index
@@ -295,8 +370,9 @@ def get_rescuenet_idx(root, train=True, label_num=900):
             idx_list = f.read().splitlines()
         return idx_list
     
-    labeled_file_name = root + '/train_labeled.txt'
-    unlabeled_file_name = root + '/train_unlabeled.txt'
+    suffix = f'_{split}' if split else ''
+    labeled_file_name = root + f'/train_labeled{suffix}.txt'
+    unlabeled_file_name = root + f'/train_unlabeled{suffix}.txt'
 
     with open(labeled_file_name) as f:
         labeled_idx_list = f.read().splitlines()
@@ -306,7 +382,7 @@ def get_rescuenet_idx(root, train=True, label_num=900):
 
     return labeled_idx_list, unlabeled_idx_list
 
-def get_floodnet_idx(root, train=True, label_num=5):
+def get_floodnet_idx(root, train=True, label_num=5, split=None):
     root = os.path.expanduser(root)
 
     # Load validation/test index
@@ -316,8 +392,9 @@ def get_floodnet_idx(root, train=True, label_num=5):
             idx_list = f.read().splitlines()
         return idx_list
     
-    labeled_file_name = root + '/train_labeled.txt'
-    unlabeled_file_name = root + '/train_unlabeled.txt'
+    suffix = f'_{split}' if split else ''
+    labeled_file_name = root + f'/train_labeled{suffix}.txt'
+    unlabeled_file_name = root + f'/train_unlabeled{suffix}.txt'
 
     with open(labeled_file_name) as f:
         labeled_idx_list = f.read().splitlines()
@@ -420,8 +497,15 @@ class BuildDataset(Dataset):
 # Create data loader in PyTorch format
 # --------------------------------------------------------------------------------
 class BuildDataLoader:
-    def __init__(self, dataset, num_labels):
+    def __init__(self, dataset, num_labels, split=None, num_workers=4, val_num_workers=4,
+                 pin_memory=False, prefetch_factor=4, persistent_workers=True):
         self.dataset = dataset
+        self.split = split
+        self.num_workers = num_workers
+        self.val_num_workers = val_num_workers
+        self.pin_memory = pin_memory
+        self.prefetch_factor = prefetch_factor
+        self.persistent_workers = persistent_workers
         if dataset == 'pascal':
             self.data_path = 'dataset/pascal'
             self.im_size = [513, 513]
@@ -459,7 +543,7 @@ class BuildDataLoader:
             self.num_segments = 11
             self.scale_size = (1.0, 1.0)
             self.batch_size = 4
-            self.train_l_idx, self.train_u_idx = get_rescuenet_idx(self.data_path, train=True, label_num=num_labels)
+            self.train_l_idx, self.train_u_idx = get_rescuenet_idx(self.data_path, train=True, label_num=num_labels, split=split)
             self.test_idx = get_rescuenet_idx(self.data_path, train=False)
 
         if dataset == 'floodnet':
@@ -468,12 +552,23 @@ class BuildDataLoader:
             self.crop_size = [750, 750]
             self.num_segments = 10
             self.scale_size = (1.0, 1.0)
-            self.batch_size = 3
-            self.train_l_idx, self.train_u_idx = get_floodnet_idx(self.data_path, train=True, label_num=num_labels)
+            self.batch_size = 4
+            self.train_l_idx, self.train_u_idx = get_floodnet_idx(self.data_path, train=True, label_num=num_labels, split=split)
             self.test_idx = get_floodnet_idx(self.data_path, train=False)
 
         if num_labels == 0:  # using all data
             self.train_l_idx = self.train_u_idx
+
+    def dataloader_kwargs(self, train=True):
+        workers = self.num_workers if train else self.val_num_workers
+        kwargs = {
+            'num_workers': workers,
+            'pin_memory': self.pin_memory,
+        }
+        if workers > 0:
+            kwargs['prefetch_factor'] = self.prefetch_factor
+            kwargs['persistent_workers'] = self.persistent_workers
+        return kwargs
 
     def build(self, supervised=False, partial=None, partial_seed=None):
         train_l_dataset = BuildDataset(self.data_path, self.dataset, self.train_l_idx,
@@ -501,6 +596,7 @@ class BuildDataLoader:
                                           replacement=True,
                                           num_samples=num_samples),
             drop_last=True,
+            **self.dataloader_kwargs(train=True),
         )
 
         if not supervised:
@@ -511,12 +607,14 @@ class BuildDataLoader:
                                               replacement=True,
                                               num_samples=num_samples),
                 drop_last=True,
+                **self.dataloader_kwargs(train=True),
             )
 
         test_loader = torch.utils.data.DataLoader(
             test_dataset,
             batch_size=1,  # Change test loader batchsize to 1. Otherwise OOM.
             shuffle=False,
+            **self.dataloader_kwargs(train=False),
         )
         if supervised:
             return train_l_loader, test_loader
@@ -697,4 +795,3 @@ def color_map(mask, colormap):
     for i in np.unique(mask):
         color_mask[mask == i] = colormap[i]
     return np.uint8(color_mask)
-

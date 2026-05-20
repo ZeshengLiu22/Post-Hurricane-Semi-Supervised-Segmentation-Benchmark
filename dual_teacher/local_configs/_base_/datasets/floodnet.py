@@ -44,7 +44,11 @@ test_pipeline = [
 ]
 data = dict(
     samples_per_gpu=4,
-    workers_per_gpu=0,
+    workers_per_gpu=8,
+    val_workers_per_gpu=8,
+    pin_memory=True,
+    prefetch_factor=2,
+    persistent_workers=True,
     train=dict(
         type=dataset_type,
         data_root=data_root,

@@ -27,7 +27,7 @@ parser.add_argument('--config', type=str, required=True)
 parser.add_argument('--labeled-id-path', type=str, required=True)
 parser.add_argument('--unlabeled-id-path', type=str, default=None)
 parser.add_argument('--save-path', type=str, required=True)
-parser.add_argument('--local_rank', default=0, type=int)
+parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
 
@@ -74,9 +74,18 @@ def colorize_mask_fixed(pred_mask, dataset):
 def evaluate(model, loader, mode, cfg, eval=False):
     model.eval()
     assert mode in ['original', 'center_crop', 'sliding_window']
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    device = torch.device('cuda', torch.cuda.current_device())
+    amp_enabled = bool(cfg.get('amp', False))
+    amp_dtype_name = str(cfg.get('amp_dtype', 'bfloat16')).lower()
+    amp_dtype = torch.bfloat16 if amp_dtype_name in ('bf16', 'bfloat16') else torch.float16
     intersection_meter = AverageMeter()
     union_meter = AverageMeter()
     target_meter = AverageMeter()  # New: to accumulate ground truth pixel counts per class
+    intersection_sum = np.zeros(cfg['nclass'], dtype=np.float64)
+    union_sum = np.zeros(cfg['nclass'], dtype=np.float64)
+    target_sum = np.zeros(cfg['nclass'], dtype=np.float64)
     
     per_image_ious = []
     image_ids = []
@@ -87,18 +96,19 @@ def evaluate(model, loader, mode, cfg, eval=False):
     worst_id = None
 
     with torch.no_grad():
-        for img, mask, id in tqdm(loader):            
-            img = img.cuda()
+        for img, mask, id in tqdm(loader, disable=(rank != 0)):
+            img = img.cuda(non_blocking=True)
 
             if mode == 'sliding_window':
                 grid = cfg['crop_size']
                 b, _, h, w = img.shape
-                final = torch.zeros(b, 19, h, w).cuda()
+                final = torch.zeros(b, cfg['nclass'], h, w, device=img.device)
                 row = 0
                 while row < h:
                     col = 0
                     while col < w:
-                        pred = model(img[:, :, row: min(h, row + grid), col: min(w, col + grid)])
+                        with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                            pred = model(img[:, :, row: min(h, row + grid), col: min(w, col + grid)])
                         final[:, :, row: min(h, row + grid), col: min(w, col + grid)] += pred.softmax(dim=1)
                         col += int(grid * 2 / 3)
                     row += int(grid * 2 / 3)
@@ -112,10 +122,14 @@ def evaluate(model, loader, mode, cfg, eval=False):
                     img = img[:, :, start_h:start_h + cfg['crop_size'], start_w:start_w + cfg['crop_size']]
                     mask = mask[:, start_h:start_h + cfg['crop_size'], start_w:start_w + cfg['crop_size']]
 
-                pred = model(img).argmax(dim=1)
+                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    pred = model(img).argmax(dim=1)
 
             intersection, union, target = \
                 intersectionAndUnion(pred.cpu().numpy(), mask.numpy(), cfg['nclass'], 255)
+            intersection_sum += intersection
+            union_sum += union
+            target_sum += target
 
             if eval:
                 for i in range(pred.shape[0]):
@@ -125,20 +139,6 @@ def evaluate(model, loader, mode, cfg, eval=False):
                     save_name = id[i].split('/')[2].split(' ')[0].replace('.jpg', '_pred.png')
                     color_mask.save(os.path.join("./predictions/RescueNet", save_name))
 
-            reduced_intersection = torch.from_numpy(intersection).cuda()
-            reduced_union = torch.from_numpy(union).cuda()
-            reduced_target = torch.from_numpy(target).cuda()
-
-            dist.all_reduce(reduced_intersection)
-            dist.all_reduce(reduced_union)
-            dist.all_reduce(reduced_target)
-
-            intersection_meter.update(reduced_intersection.cpu().numpy())
-            union_meter.update(reduced_union.cpu().numpy())
-            target_meter.update(reduced_target.cpu().numpy())  # New: accumulate class pixel frequencies
-
-            iou_class = intersection_meter.sum / (union_meter.sum + 1e-10) * 100.0
-            mIOU = np.mean(iou_class)
             for i in range(pred.shape[0]):
                 inter = ((pred[i].cpu().numpy() == mask[i].numpy()) & (mask[i].numpy() != 255)).sum()
                 union = ((pred[i].cpu().numpy() != 255) | (mask[i].numpy() != 255)).sum()
@@ -153,13 +153,30 @@ def evaluate(model, loader, mode, cfg, eval=False):
                     worst_iou = iou
                     worst_id = id[i]
 
+    reduced_intersection = torch.from_numpy(intersection_sum).to(device=device)
+    reduced_union = torch.from_numpy(union_sum).to(device=device)
+    reduced_target = torch.from_numpy(target_sum).to(device=device)
+
+    if distributed:
+        dist.all_reduce(reduced_intersection)
+        dist.all_reduce(reduced_union)
+        dist.all_reduce(reduced_target)
+
+    intersection_meter.update(reduced_intersection.cpu().numpy())
+    union_meter.update(reduced_union.cpu().numpy())
+    target_meter.update(reduced_target.cpu().numpy())  # New: accumulate class pixel frequencies
+
+    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10) * 100.0
+    mIOU = np.mean(iou_class)
+
     avg_iou = np.mean(per_image_ious)
     std_iou = np.std(per_image_ious)
 
-    print(f"Mean IoU: {mIOU:.2f}")
-    print(f"Image-level IoU - Average: {avg_iou:.2f}, Std Dev: {std_iou:.2f}")
-    print(f"Best Image: ID = {best_id}, IoU = {best_iou:.2f}")
-    print(f"Worst Image: ID = {worst_id}, IoU = {worst_iou:.2f}")
+    if rank == 0:
+        print(f"Mean IoU: {mIOU:.2f}")
+        print(f"Image-level IoU - Average: {avg_iou:.2f}, Std Dev: {std_iou:.2f}")
+        print(f"Best Image: ID = {best_id}, IoU = {best_iou:.2f}")
+        print(f"Worst Image: ID = {worst_id}, IoU = {worst_iou:.2f}")
 
     # New: compute FWIoU
     freq = target_meter.sum / (np.sum(target_meter.sum) + 1e-10)
@@ -275,7 +292,7 @@ def main():
                 logger.info('Iters: {:}, Total loss: {:.3f}'.format(i, total_loss.avg))
 
         eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
-        mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg)
+        mIoU, iou_class, *_ = evaluate(model, valloader, eval_mode, cfg)
 
         if rank == 0:
             for (cls_idx, iou) in enumerate(iou_class):

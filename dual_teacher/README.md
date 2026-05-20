@@ -1,76 +1,120 @@
-<div align="center">
+# Dual-Teacher
 
-## Switching Temporary Teachers for Semi-Supervised Semantic Segmentation
-  
-[![PWC](https://img.shields.io/badge/NeurIPS%20-2023-8A2BE2)](https://nips.cc/virtual/2023/poster/72052)
-</div>
+This directory contains the adapted Dual-Teacher code used in the post-hurricane semi-supervised segmentation benchmark.
 
-> **Switching Temporary Teachers for Semi-Supervised Semantic Segmentation**<br>
-> [Jaemin Na](https://najaemin92.github.io), [Jung-Woo Ha](https://scholar.google.com/citations?user=eGj3ay4AAAAJ&hl), [Hyung Jin Chang](https://hyungjinchang.wordpress.com), [Dongyoon Han*](https://dongyoonhan.github.io/), and [Wonjun Hwang*](https://scholar.google.co.uk/citations?user=-I8AfBAAAAAJ&hl=en).<br>
-> In NeurIPS 2023.<br><br/>
+Use the root project README for the full benchmark workflow. This file only covers direct Dual-Teacher commands.
 
-<div align=center><img src="https://github.com/NaJaeMin92/Dual-Teacher/blob/main/main_fig.png" width="60%"></div><br/>
+## Setup
 
-<!-- [YouTube](https://www.youtube.com/watchwatch?v=o0jEox4z3OI)<br> -->
-> **Abstract:** *The teacher-student framework, prevalent in semi-supervised semantic segmentation, mainly employs the exponential moving average (EMA) to update a single teacher's weights based on those of the student. However, EMA updates raise a problem in that the weights of the teacher and student are getting coupled, causing a potential performance bottleneck. Furthermore, this problem may get severer when training with more complicated labels such as segmentation masks but with few annotated data. This paper introduces Dual Teacher, a simple yet effective approach that employs dual temporary teachers aiming to the student to alleviate the coupling problem. The temporary teachers work in shifts and are progressively improved, so consistently keep the teacher and student from becoming excessively close. Specifically, the temporary teachers periodically take turns generating pseudo-labels to train a student model and keep the distinct characteristics of the student model for each epoch. Consequently, Dual Teacher achieves competitive performance on the PASCAL VOC, Cityscapes, and ADE20K benchmarks with remarkably shorter training times than state-of-the-art methods. Moreover, we demonstrate that our approach is model-agnostic and compatible with both CNN- and Transformer-based models.*
+From the repository root:
 
-
-## Dataset
-Download [ADE20K](https://groups.csail.mit.edu/vision/datasets/ADE20K) dataset and modify your path in [configuration file](https://github.com/NaJaeMin92/Dual-Teacher/blob/d3f177e727d93879ab09d9ad5e99a33151142d28/local_configs/_base_/datasets/ade20k_repeat.py#L3).  
-For semi-supervised learning scenarios, split the images based on the partitions of the text files in the [ADEChallengeData2016](https://github.com/NaJaeMin92/Dual-Teacher/tree/d3f177e727d93879ab09d9ad5e99a33151142d28/data/ADEChallengeData2016).
-```
-├── ./data
-    ├── ADEChallengeData2016
-        ├── images
-          ├── training631_l
-          ├── training631_u
-        ├── annotations
-          ├── training631_l
-          ├── training631_u
+```bash
+python3 tools/prepare_method_datasets.py
+python3 tools/check_pretrained_weights.py
 ```
 
-## Installation
-For installation, please refer to the guidelines in [MMSegmentation v0.13.0](https://github.com/open-mmlab/mmsegmentation/tree/v0.13.0).
+The setup creates split-specific symlink trees under `dual_teacher/data/{dataset}_{split}/` and expects `dual_teacher/pretrained/mit_b1.pth`.
 
-Other requirements:
-```pip install timm==0.3.2```
+Activate the Dual-Teacher environment before running:
 
-An example (works for me): ```CUDA 10.1``` and  ```pytorch 1.7.1``` 
-
-```
-pip install torchvision==0.8.2
-pip install timm==0.3.2
-pip install mmcv-full==1.2.7
-pip install opencv-python==4.5.1.48
-cd Dual-Teacher && pip install -e . --user
+```bash
+conda activate dual_teacher
 ```
 
-## Training
+After installing dependencies, install the local package if needed:
 
-Download `initial weights` 
-(
-[google drive](https://drive.google.com/file/d/1TKC3ajdhRmSgrqW6Bnl0PpS9mN3UpM4n/view?usp=share_link)
-) 
-pretrained on ImageNet-1K, and put them in a folder ```pretrained/```.  
-
-Modify `img_dir` and `ann_dir` according to the partitions in [configuration file](https://github.com/NaJaeMin92/Dual-Teacher/blob/d3f177e727d93879ab09d9ad5e99a33151142d28/local_configs/_base_/datasets/ade20k_repeat.py#L50).
-```
-bash dist_train.sh # Multi-gpu training
-```
-## License
-
-Please find the [LICENSE](https://github.com/NaJaeMin92/Dual-Teacher/blob/main/LICENSE) file. This code, built on the [SegFormer codebase](https://github.com/NVlabs/SegFormer), adheres to the same license.
-
-## Citation
-```bibtex  
-@inproceedings{na2023switching,
-  title={Switching Temporary Teachers for Semi-Supervised Semantic Segmentation},
-  author={Jaemin Na and Jungwoo Ha and Hyungjin Chang and Dongyoon Han and Wonjun Hwang},
-  journal={Advances in Neural Information Processing Systems (NeurIPS)},
-  year={2023}
-}
+```bash
+cd dual_teacher
+pip install -e . --user
 ```
 
-## Contact
-For questions, please contact: osial46@ajou.ac.kr
+This project has been run with Python 3.8, PyTorch 1.10.1+cu113, CUDA 11.3, MMCV 1.3.17, and MMSegmentation 0.11.0. Headless OpenCV is recommended on servers.
 
+## Run All Benchmark Splits
+
+From the repository root:
+
+```bash
+bash scripts/run_dual_teacher_benchmark.sh
+```
+
+Useful overrides:
+
+```bash
+RUN_ID=trial1 NUM_GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/run_dual_teacher_benchmark.sh
+PREP_DATA=0 EPOCHS=150 AMP=false BASE_PORT=29920 bash scripts/run_dual_teacher_benchmark.sh
+AMP=true RUN_ID=amp_trial bash scripts/run_dual_teacher_benchmark.sh
+```
+
+Dual-Teacher defaults to full precision in the benchmark launcher because that matched the previously stable runs. Set `AMP=true` only for an explicit precision experiment.
+
+## Direct Training
+
+Run from `dual_teacher/`:
+
+```bash
+cd dual_teacher
+torchrun --nproc_per_node=4 --master_port=29900 tools/train-rescue.py \
+  --ddp \
+  --dual_teacher \
+  --backbone mit_b1 \
+  --split 25 \
+  --epochs 150 \
+  --amp false \
+  --port 29900 \
+  --work-dir work_dirs/benchmark_rescuenet_25_manual
+
+torchrun --nproc_per_node=4 --master_port=29901 tools/train-flood.py \
+  --ddp \
+  --dual_teacher \
+  --backbone mit_b1 \
+  --split 25 \
+  --epochs 150 \
+  --amp false \
+  --port 29901 \
+  --work-dir work_dirs/benchmark_floodnet_25_manual
+```
+
+Change `--split` to `12_5`, `25`, or `50`.
+
+## Direct Evaluation
+
+Metric scripts:
+
+```bash
+cd dual_teacher
+python tools/eval-rescuenet.py \
+  --config work_dirs/benchmark_rescuenet_25_manual/segformer.b1.512x512.rescuenet.160k.py \
+  --checkpoint work_dirs/benchmark_rescuenet_25_manual/best_weights.pth \
+  --backbone mit_b1 \
+  --num-classes 11
+
+python tools/eval-floodnet.py \
+  --config work_dirs/benchmark_floodnet_25_manual/segformer.b1.512x512.floodnet.160k.py \
+  --checkpoint work_dirs/benchmark_floodnet_25_manual/best_weights.pth \
+  --backbone mit_b1 \
+  --num-classes 10
+```
+
+Prediction export scripts:
+
+```bash
+cd dual_teacher
+python tools/eval-dual-teacher-rescuenet.py \
+  --val-img-dir data/rescuenet_25/images/val-org-img \
+  --val-mask-dir data/rescuenet_25/annotations/val-label-img \
+  --checkpoint work_dirs/benchmark_rescuenet_25_manual/best_weights.pth \
+  --save-dir predictions/rescuenet_25
+
+python tools/eval-dual-teacher-floodnet.py \
+  --val-img-dir data/floodnet_25/images/val-org-img \
+  --val-mask-dir data/floodnet_25/annotations/val-label-img \
+  --checkpoint work_dirs/benchmark_floodnet_25_manual/best_weights.pth \
+  --save-dir predictions/floodnet_25
+```
+
+For comparable cross-method metrics, prefer the root `tools/evaluate_semi_supervised_final.py` evaluator.
+
+## Upstream Reference
+
+Original project: <https://github.com/NaJaeMin92/Dual-Teacher>

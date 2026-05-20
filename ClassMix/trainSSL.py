@@ -14,7 +14,10 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
 from torch.utils import data, model_zoo
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel
 from torch.autograd import Variable
 import torchvision.transforms as transform
 
@@ -29,9 +32,6 @@ from utils import transformsgpu
 from utils.helpers import colorize_mask
 import utils.palette as palette
 
-from utils.sync_batchnorm import convert_model
-from utils.sync_batchnorm import DataParallelWithCallback
-
 from data.voc_dataset import VOCDataSet
 
 from data import get_loader, get_data_path
@@ -41,6 +41,7 @@ from tqdm import tqdm
 import PIL
 from torchvision import transforms
 import json
+from pathlib import Path
 from torch.utils import tensorboard
 from evaluateSSL import evaluate
 
@@ -49,6 +50,60 @@ import torch.backends.cudnn as cudnn
 
 start = timeit.default_timer()
 start_writeable = datetime.datetime.now().strftime('%m-%d_%H-%M')
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CLASSMIX_COCO_PRETRAIN = os.environ.get(
+    'CLASSMIX_COCO_PRETRAIN',
+    str(PROJECT_ROOT / 'ClassMix' / 'pretrained' / 'resnet101COCO-41f33a49.pth'),
+)
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in ('yes', 'true', 't', '1', 'y'):
+        return True
+    if value in ('no', 'false', 'f', '0', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
+
+
+def dataloader_kwargs(num_workers, pin_memory, prefetch_factor, persistent_workers):
+    kwargs = {
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+    }
+    if num_workers > 0:
+        kwargs['prefetch_factor'] = prefetch_factor
+        kwargs['persistent_workers'] = persistent_workers
+    return kwargs
+
+
+def setup_distributed():
+    if 'RANK' not in os.environ or 'WORLD_SIZE' not in os.environ:
+        return False, 0, 0, 1
+
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl', init_method='env://')
+    return True, local_rank, dist.get_rank(), dist.get_world_size()
+
+
+def cleanup_distributed():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def unwrap_model(model):
+    return model.module if hasattr(model, 'module') else model
+
+
+def is_main_process():
+    return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+
+
+def amp_dtype_from_args():
+    return torch.bfloat16 if args.amp_dtype == 'bf16' else torch.float16
 
 
 def get_arguments():
@@ -66,19 +121,18 @@ def get_arguments():
                         help='Path to the .pth file to resume from (default: None)')
     parser.add_argument("-n", "--name", type=str, default=None, required=True,
                         help='Name of the run (default: None)')
-    parser.add_argument("--save-images", type=str, default=True,
-                        help='Include to save images (default: None)')
+    parser.add_argument("--save-images", type=str2bool, default=False,
+                        help='Save debug unlabeled images under the run checkpoint dir (default: false)')
+    parser.add_argument("--amp", type=str2bool, default=True,
+                        help='Use CUDA AMP for forward/backward (default: true)')
+    parser.add_argument("--amp-dtype", type=str, default='bf16', choices=['bf16', 'fp16'],
+                        help='AMP dtype. bf16 is intended for H100/Ampere+ GPUs (default: bf16)')
     return parser.parse_args()
 
 
 
-def loss_calc(pred, label):
-    label = Variable(label.long()).cuda()
-    if len(gpus) > 1:
-        criterion = torch.nn.DataParallel(CrossEntropy2d(ignore_label=ignore_label), device_ids=gpus).cuda()  # Ignore label ??
-    else:
-        criterion = CrossEntropy2d(ignore_label=ignore_label).cuda()  # Ignore label ??
-
+def loss_calc(pred, label, criterion):
+    label = Variable(label.long()).cuda(non_blocking=True)
     return criterion(pred, label)
 
 def lr_poly(base_lr, iter, max_iter, power):
@@ -101,28 +155,22 @@ def create_ema_model(model):
 
     for param in ema_model.parameters():
         param.detach_()
-    mp = list(model.parameters())
+    mp = list(unwrap_model(model).parameters())
     mcp = list(ema_model.parameters())
     n = len(mp)
     for i in range(0, n):
         mcp[i].data[:] = mp[i].data[:].clone()
-    if len(gpus)>1:
-        if use_sync_batchnorm:
-            ema_model = convert_model(ema_model)
-            ema_model = DataParallelWithCallback(ema_model, device_ids=gpus)
-        else:
-            ema_model = torch.nn.DataParallel(ema_model, device_ids=gpus)
+    if distributed and use_sync_batchnorm:
+        ema_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(ema_model)
     return ema_model
 
 def update_ema_variables(ema_model, model, alpha_teacher, iteration):
     # Use the "true" average until the exponential average is more correct
     alpha_teacher = min(1 - 1 / (iteration + 1), alpha_teacher)
-    if len(gpus)>1:
-        for ema_param, param in zip(ema_model.module.parameters(), model.module.parameters()):
-            ema_param.data[:] = alpha_teacher * ema_param[:].data[:] + (1 - alpha_teacher) * param[:].data[:]
-    else:
-        for ema_param, param in zip(ema_model.parameters(), model.parameters()):
-            ema_param.data[:] = alpha_teacher * ema_param[:].data[:] + (1 - alpha_teacher) * param[:].data[:]
+    ema_model = unwrap_model(ema_model)
+    model = unwrap_model(model)
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data[:] = alpha_teacher * ema_param[:].data[:] + (1 - alpha_teacher) * param[:].data[:]
     return ema_model
 
 def strongTransform(parameters, data=None, target=None):
@@ -160,6 +208,8 @@ class Learning_Rate_Object(object):
         self.learning_rate = learning_rate
 
 def save_image(image, epoch, id, palette):
+    debug_dir = os.path.join(checkpoint_dir, 'debug_images')
+    os.makedirs(debug_dir, exist_ok=True)
     with torch.no_grad():
         if image.shape[0] == 3:
             restore_transform = transforms.Compose([
@@ -168,26 +218,24 @@ def save_image(image, epoch, id, palette):
 
             image = restore_transform(image)
             #image = PIL.Image.fromarray(np.array(image)[:, :, ::-1])  # BGR->RGB
-            image.save(os.path.join('../../../data/jpk322/ClassMix/FloodNet/', str(epoch)+ id + '.png'))
+            image.save(os.path.join(debug_dir, str(epoch)+ id + '.png'))
         else:
             mask = image.numpy()
             colorized_mask = colorize_mask(mask, palette)
-            colorized_mask.save(os.path.join('../../../data/jpk322/ClassMix/FloodNet/', str(epoch)+ id + '.png'))
+            colorized_mask.save(os.path.join(debug_dir, str(epoch)+ id + '.png'))
 
 def _save_checkpoint(iteration, model, optimizer, config, ema_model, save_best=False, overwrite=True):
+    if not is_main_process():
+        return
+
     checkpoint = {
         'iteration': iteration,
         'optimizer': optimizer.state_dict(),
         'config': config,
     }
-    if len(gpus) > 1:
-        checkpoint['model'] = model.module.state_dict()
-        if train_unlabeled:
-            checkpoint['ema_model'] = ema_model.module.state_dict()
-    else:
-        checkpoint['model'] = model.state_dict()
-        if train_unlabeled:
-            checkpoint['ema_model'] = ema_model.state_dict()
+    checkpoint['model'] = unwrap_model(model).state_dict()
+    if train_unlabeled:
+        checkpoint['ema_model'] = unwrap_model(ema_model).state_dict()
 
     if save_best:
         filename = os.path.join(checkpoint_dir, f'best_model.pth')
@@ -211,36 +259,30 @@ def _resume_checkpoint(resume_path, model, optimizer, ema_model):
     iteration = checkpoint['iteration'] + 1
     print('Starting at iteration: ' + str(iteration))
 
-    if len(gpus) > 1:
-        model.module.load_state_dict(checkpoint['model'])
-    else:
-        model.load_state_dict(checkpoint['model'])
+    unwrap_model(model).load_state_dict(checkpoint['model'])
 
     optimizer.load_state_dict(checkpoint['optimizer'])
 
     if train_unlabeled:
-        if len(gpus) > 1:
-            ema_model.module.load_state_dict(checkpoint['ema_model'])
-        else:
-            ema_model.load_state_dict(checkpoint['ema_model'])
+        unwrap_model(ema_model).load_state_dict(checkpoint['ema_model'])
 
     return iteration, model, optimizer, ema_model
 
 def main():
-    print(config)
+    global num_iterations
+    if is_main_process():
+        print(config)
 
     best_mIoU = 0
+    amp_enabled = args.amp and torch.cuda.is_available()
+    amp_dtype = amp_dtype_from_args()
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and amp_dtype == torch.float16)
+    supervised_loss = CrossEntropy2d(ignore_label=ignore_label).cuda()
 
     if consistency_loss == 'CE':
-        if len(gpus) > 1:
-            unlabeled_loss = torch.nn.DataParallel(CrossEntropyLoss2dPixelWiseWeighted(ignore_index=ignore_label), device_ids=gpus).cuda()
-        else:
-            unlabeled_loss = CrossEntropyLoss2dPixelWiseWeighted().cuda()
+        unlabeled_loss = CrossEntropyLoss2dPixelWiseWeighted(ignore_index=ignore_label).cuda()
     elif consistency_loss == 'MSE':
-        if len(gpus) > 1:
-            unlabeled_loss =  torch.nn.DataParallel(MSELoss2d(), device_ids=gpus).cuda()
-        else:
-            unlabeled_loss =  MSELoss2d().cuda()
+        unlabeled_loss = MSELoss2d().cuda()
 
     # cudnn.enabled = True
 
@@ -248,18 +290,19 @@ def main():
     # cudnn.enabled = False 
     model = Res_Deeplab(num_classes=num_classes)
 
-    # load pretrained parameters
-    if restore_from[:4] == 'http' :
-        saved_state_dict = model_zoo.load_url(restore_from)
-    else:
-        saved_state_dict = torch.load(restore_from)
+    if restore_from:
+        # load pretrained parameters
+        if restore_from[:4] == 'http' :
+            saved_state_dict = model_zoo.load_url(restore_from)
+        else:
+            saved_state_dict = torch.load(restore_from)
 
-    # Copy loaded parameters to model
-    new_params = model.state_dict().copy()
-    for name, param in new_params.items():
-        if name in saved_state_dict and param.size() == saved_state_dict[name].size():
-            new_params[name].copy_(saved_state_dict[name])
-    model.load_state_dict(new_params)
+        # Copy loaded parameters to model
+        new_params = model.state_dict().copy()
+        for name, param in new_params.items():
+            if name in saved_state_dict and param.size() == saved_state_dict[name].size():
+                new_params[name].copy_(saved_state_dict[name])
+        model.load_state_dict(new_params)
 
     # Initiate ema-model
     if train_unlabeled:
@@ -269,14 +312,17 @@ def main():
     else:
         ema_model = None
 
-    if len(gpus)>1:
-        if use_sync_batchnorm:
-            model = convert_model(model)
-            model = DataParallelWithCallback(model, device_ids=gpus)
-        else:
-            model = torch.nn.DataParallel(model, device_ids=gpus)
+    if distributed and use_sync_batchnorm:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.train()
     model.cuda()
+    if distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
 
     cudnn.benchmark = True
 
@@ -288,14 +334,14 @@ def main():
     if dataset == 'rescuenet':
         data_loader = get_loader(dataset)
         data_path = get_data_path(dataset)
-        train_dataset = data_loader(data_path, crop_size=input_size, scale=random_scale, mirror=random_flip)
-        train_unlabeled_dataset = data_loader(data_path, crop_size=input_size, scale=random_scale, mirror=random_flip, unlabeled=True)
+        train_dataset = data_loader(data_path, crop_size=input_size, scale=random_scale, mirror=random_flip, split_percent=split_percent)
+        train_unlabeled_dataset = data_loader(data_path, crop_size=input_size, scale=random_scale, mirror=random_flip, unlabeled=True, split_percent=split_percent)
     
     if dataset == 'floodnet':
         data_loader = get_loader(dataset)
         data_path = get_data_path(dataset)
-        train_dataset = data_loader(data_path, crop_size=input_size, scale=random_scale, mirror=random_flip)
-        train_unlabeled_dataset = data_loader(data_path, crop_size=input_size, scale=random_scale, mirror=random_flip, unlabeled=True)
+        train_dataset = data_loader(data_path, crop_size=input_size, scale=random_scale, mirror=random_flip, split_percent=split_percent)
+        train_unlabeled_dataset = data_loader(data_path, crop_size=input_size, scale=random_scale, mirror=random_flip, unlabeled=True, split_percent=split_percent)
 
     elif dataset == 'cityscapes':
         data_loader = get_loader('cityscapes')
@@ -307,38 +353,54 @@ def main():
 
         train_dataset = data_loader(data_path, is_transform=True, augmentations=data_aug, img_size=input_size)
 
+    if training_epochs is not None:
+        steps_per_epoch = max(1, len(train_dataset) // batch_size)
+        num_iterations = int(steps_per_epoch * training_epochs)
+        config['training']['num_iterations'] = num_iterations
+
     train_dataset_size = len(train_dataset) + len(train_unlabeled_dataset)
-    print ('dataset size: ', train_dataset_size)
+    if is_main_process():
+        print ('dataset size: ', train_dataset_size)
 
     partial_size = labeled_samples
-    print('Training with labeled samples:', partial_size)
+    if is_main_process():
+        print('Training with labeled samples:', partial_size)
     if split_id is not None:
         train_ids = pickle.load(open(split_id, 'rb'))
-        print('loading train ids from {}'.format(split_id))
+        if is_main_process():
+            print('loading train ids from {}'.format(split_id))
     else:
         np.random.seed(random_seed)
         train_ids = np.arange(train_dataset_size)
         np.random.shuffle(train_ids)
 
-    trainloader = data.DataLoader(train_dataset,
-                    batch_size=batch_size, num_workers=num_workers, pin_memory=False)
+    train_sampler = DistributedSampler(train_dataset, shuffle=True) if distributed else None
+    trainloader = data.DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),
+        **dataloader_kwargs(num_workers, pin_memory, prefetch_factor, persistent_workers),
+    )
     trainloader_iter = iter(trainloader)
 
     if train_unlabeled:
-        trainloader_remain = data.DataLoader(train_unlabeled_dataset,
-                    batch_size=batch_size, num_workers=1, pin_memory=False)
+        train_remain_sampler = DistributedSampler(train_unlabeled_dataset, shuffle=True) if distributed else None
+        trainloader_remain = data.DataLoader(
+            train_unlabeled_dataset,
+            batch_size=batch_size,
+            sampler=train_remain_sampler,
+            shuffle=(train_remain_sampler is None),
+            **dataloader_kwargs(unlabeled_num_workers, pin_memory, prefetch_factor, persistent_workers),
+        )
         trainloader_remain_iter = iter(trainloader_remain)
 
     # Optimizer for segmentation network
     learning_rate_object = Learning_Rate_Object(config['training']['learning_rate'])
 
     if optimizer_type == 'SGD':
-        if len(gpus) > 1:
-            optimizer = optim.SGD(model.module.optim_parameters(learning_rate_object),
-                        lr=learning_rate, momentum=momentum,weight_decay=weight_decay)
-        else:
-            optimizer = optim.SGD(model.optim_parameters(learning_rate_object),
-                        lr=learning_rate, momentum=momentum,weight_decay=weight_decay)
+        optimizer = optim.SGD(unwrap_model(model).optim_parameters(learning_rate_object),
+                    lr=learning_rate, momentum=momentum,weight_decay=weight_decay)
 
     optimizer.zero_grad()
 
@@ -353,11 +415,12 @@ def main():
     if train_unlabeled:
         accumulated_loss_u = []
 
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-    with open(checkpoint_dir + '/config.json', 'w') as handle:
-        json.dump(config, handle, indent=4, sort_keys=False)
-    pickle.dump(train_ids, open(os.path.join(checkpoint_dir, 'train_split.pkl'), 'wb'))
+    if is_main_process():
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+        with open(checkpoint_dir + '/config.json', 'w') as handle:
+            json.dump(config, handle, indent=4, sort_keys=False)
+        pickle.dump(train_ids, open(os.path.join(checkpoint_dir, 'train_split.pkl'), 'wb'))
 
     epochs_since_start = 0
     for i_iter in range(start_iteration, num_iterations):
@@ -379,20 +442,24 @@ def main():
                 batch = next(trainloader_iter)
         except:
             epochs_since_start = epochs_since_start + 1
-            print('Epochs since start: ',epochs_since_start)
+            if distributed and train_sampler is not None:
+                train_sampler.set_epoch(epochs_since_start)
+            if is_main_process():
+                print('Epochs since start: ',epochs_since_start)
             trainloader_iter = iter(trainloader)
             batch = next(trainloader_iter)
 
         weak_parameters={"flip": 0}
 
         images, labels, _, _, _ = batch
-        images = images.cuda()
-        labels = labels.cuda()
+        images = images.cuda(non_blocking=True)
+        labels = labels.cuda(non_blocking=True)
 
         images, labels = weakTransform(weak_parameters, data = images, target = labels)
-        pred = interp(model(images))
 
-        L_l = loss_calc(pred, labels)
+        with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+            pred = interp(model(images))
+            L_l = loss_calc(pred, labels, supervised_loss)
 
         if train_unlabeled:
             try:
@@ -404,9 +471,11 @@ def main():
                 batch_remain = next(trainloader_remain_iter)
 
             images_remain, _, _, _, _ = batch_remain
-            images_remain = images_remain.cuda()
+            images_remain = images_remain.cuda(non_blocking=True)
             inputs_u_w, _ = weakTransform(weak_parameters, data = images_remain)
-            logits_u_w = interp(ema_model(inputs_u_w))
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                    logits_u_w = interp(ema_model(inputs_u_w))
             logits_u_w, _ = weakTransform(getWeakInverseTransformParameters(weak_parameters), data = logits_u_w.detach())
 
             softmax_u_w = torch.softmax(logits_u_w.detach(), dim=1)
@@ -418,7 +487,7 @@ def main():
                     classes = torch.unique(argmax_u_w[image_i])
                     classes = classes[classes != ignore_label]
                     nclasses = classes.shape[0]
-                    classes = (classes[torch.Tensor(np.random.choice(nclasses, int((nclasses - nclasses % 2) / 2), replace=False)).long()]).cuda()
+                    classes = classes[torch.randperm(nclasses, device=classes.device)[:int((nclasses - nclasses % 2) / 2)]]
                     if image_i == 0:
                         MixMask = transformmasks.generate_class_mask(argmax_u_w[image_i], classes).unsqueeze(0).cuda()
                     else:
@@ -447,7 +516,7 @@ def main():
                         MixMask = torch.cat((MixMask,torch.from_numpy(transformmasks.generate_cow_mask(img_size, sigma, p, seed=None)).unsqueeze(0).cuda().float()))
 
             elif mix_mask == None:
-                MixMask = torch.ones((inputs_u_w.shape))
+                MixMask = torch.ones_like(inputs_u_w)
 
             strong_parameters = {"Mix": MixMask}
             if random_flip:
@@ -464,61 +533,64 @@ def main():
                 strong_parameters["GaussianBlur"] = 0
 
             inputs_u_s, _ = strongTransform(strong_parameters, data = images_remain)
-            logits_u_s = interp(model(inputs_u_s))
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                logits_u_s = interp(model(inputs_u_s))
 
             softmax_u_w_mixed, _ = strongTransform(strong_parameters, data = softmax_u_w)
             max_probs, pseudo_label = torch.max(softmax_u_w_mixed, dim=1)
 
             if pixel_weight == "threshold_uniform":
-                unlabeled_weight = torch.sum(max_probs.ge(0.968).long() == 1).item() / np.size(np.array(pseudo_label.cpu()))
-                pixelWiseWeight = unlabeled_weight * torch.ones(max_probs.shape).cuda()
+                unlabeled_weight = max_probs.ge(0.968).float().sum() / pseudo_label.numel()
+                pixelWiseWeight = torch.ones_like(max_probs) * unlabeled_weight
             elif pixel_weight == "threshold":
-                pixelWiseWeight = max_probs.ge(0.968).long().cuda()
+                pixelWiseWeight = max_probs.ge(0.968).float()
             elif pixel_weight == 'sigmoid':
                 max_iter = 10000
-                pixelWiseWeight = sigmoid_ramp_up(i_iter, max_iter) * torch.ones(max_probs.shape).cuda()
+                pixelWiseWeight = torch.ones_like(max_probs) * sigmoid_ramp_up(i_iter, max_iter)
             elif pixel_weight == False:
-                pixelWiseWeight = torch.ones(max_probs.shape).cuda()
+                pixelWiseWeight = torch.ones_like(max_probs)
 
-            if consistency_loss == 'CE':
-                L_u = consistency_weight * unlabeled_loss(logits_u_s, pseudo_label, pixelWiseWeight)
-            elif consistency_loss == 'MSE':
-                unlabeled_weight = torch.sum(max_probs.ge(0.968).long() == 1).item() / np.size(np.array(pseudo_label.cpu()))
-                #softmax_u_w_mixed = torch.cat((softmax_u_w_mixed[1].unsqueeze(0),softmax_u_w_mixed[0].unsqueeze(0)))
-                L_u = consistency_weight * unlabeled_weight * unlabeled_loss(logits_u_s, softmax_u_w_mixed)
+            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=amp_dtype):
+                if consistency_loss == 'CE':
+                    L_u = consistency_weight * unlabeled_loss(logits_u_s, pseudo_label, pixelWiseWeight)
+                elif consistency_loss == 'MSE':
+                    unlabeled_weight = max_probs.ge(0.968).float().sum() / pseudo_label.numel()
+                    #softmax_u_w_mixed = torch.cat((softmax_u_w_mixed[1].unsqueeze(0),softmax_u_w_mixed[0].unsqueeze(0)))
+                    L_u = consistency_weight * unlabeled_weight * unlabeled_loss(logits_u_s, softmax_u_w_mixed)
 
-            loss = L_l + L_u
+                loss = L_l + L_u
 
         else:
             loss = L_l
 
-        if len(gpus) > 1:
-            loss = loss.mean()
-            loss_l_value += L_l.mean().item()
-            if train_unlabeled:
-                loss_u_value += L_u.mean().item()
-        else:
-            loss_l_value += L_l.item()
-            if train_unlabeled:
-                loss_u_value += L_u.item()
+        loss = loss.mean()
+        loss_l_value += L_l.detach().float().mean().item()
+        if train_unlabeled:
+            loss_u_value += L_u.detach().float().mean().item()
 
-        loss.backward()
-        optimizer.step()
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         # update Mean teacher network
         if ema_model is not None:
             alpha_teacher = 0.99
             ema_model = update_ema_variables(ema_model = ema_model, model = model, alpha_teacher=alpha_teacher, iteration=i_iter)
 
-        if train_unlabeled:
-            print('iter = {0:6d}/{1:6d}, loss_l = {2:.3f}, loss_u = {3:.3f}'.format(i_iter, num_iterations, loss_l_value, loss_u_value))
-        else:
-            print('iter = {0:6d}/{1:6d}, loss_l = {2:.3f}'.format(i_iter, num_iterations, loss_l_value))
+        if is_main_process():
+            if train_unlabeled:
+                print('iter = {0:6d}/{1:6d}, loss_l = {2:.3f}, loss_u = {3:.3f}'.format(i_iter, num_iterations, loss_l_value, loss_u_value))
+            else:
+                print('iter = {0:6d}/{1:6d}, loss_l = {2:.3f}'.format(i_iter, num_iterations, loss_l_value))
 
         if i_iter % save_checkpoint_every == 0 and i_iter != 0:
             _save_checkpoint(i_iter, model, optimizer, config, ema_model)
 
-        if use_tensorboard:
+        if use_tensorboard and is_main_process():
             if 'tensorboard_writer' not in locals():
                 tensorboard_writer = tensorboard.SummaryWriter(log_dir, flush_secs=30)
 
@@ -536,20 +608,35 @@ def main():
 
 
         if i_iter % val_per_iter == 0 and i_iter != 0:
-            model.eval()
-            mIoU, eval_loss = evaluate(model, dataset, ignore_label=ignore_label, input_size=(512,1024), save_dir=checkpoint_dir)
+            if is_main_process():
+                model.eval()
+                mIoU, eval_loss = evaluate(
+                    unwrap_model(model),
+                    dataset,
+                    ignore_label=ignore_label,
+                    input_size=input_size,
+                    save_dir=checkpoint_dir,
+                    val_num_workers=val_num_workers,
+                    pin_memory=pin_memory,
+                    prefetch_factor=prefetch_factor,
+                    persistent_workers=persistent_workers,
+                    amp_enabled=amp_enabled,
+                    amp_dtype=amp_dtype,
+                )
 
-            model.train()
+                model.train()
 
-            if mIoU > best_mIoU and save_best_model:
-                best_mIoU = mIoU
-                _save_checkpoint(i_iter, model, optimizer, config, ema_model, save_best=True)
+                if mIoU > best_mIoU and save_best_model:
+                    best_mIoU = mIoU
+                    _save_checkpoint(i_iter, model, optimizer, config, ema_model, save_best=True)
 
-            if use_tensorboard:
-                tensorboard_writer.add_scalar('Validation/mIoU', mIoU, i_iter)
-                tensorboard_writer.add_scalar('Validation/Loss', eval_loss, i_iter)
+                if use_tensorboard:
+                    tensorboard_writer.add_scalar('Validation/mIoU', mIoU, i_iter)
+                    tensorboard_writer.add_scalar('Validation/Loss', eval_loss, i_iter)
+            if distributed:
+                dist.barrier()
 
-        if save_unlabeled_images and train_unlabeled and i_iter % save_checkpoint_every == 0:
+        if save_unlabeled_images and train_unlabeled and is_main_process() and i_iter % save_checkpoint_every == 0:
             # Saves two mixed images and the corresponding prediction
             save_image(inputs_u_s[0].cpu(),i_iter,'input1',palette.CityScpates_palette)
             save_image(inputs_u_s[1].cpu(),i_iter,'input2',palette.CityScpates_palette)
@@ -559,20 +646,35 @@ def main():
 
     _save_checkpoint(num_iterations, model, optimizer, config, ema_model)
 
-    model.eval()
-    mIoU, val_loss = evaluate(model, dataset, ignore_label=ignore_label, input_size=(512,1024), save_dir=checkpoint_dir)
+    if is_main_process():
+        model.eval()
+        mIoU, val_loss = evaluate(
+            unwrap_model(model),
+            dataset,
+            ignore_label=ignore_label,
+            input_size=input_size,
+            save_dir=checkpoint_dir,
+            val_num_workers=val_num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+        )
 
-    model.train()
-    if mIoU > best_mIoU and save_best_model:
-        best_mIoU = mIoU
-        _save_checkpoint(i_iter, model, optimizer, config, ema_model, save_best=True)
+        model.train()
+        if mIoU > best_mIoU and save_best_model:
+            best_mIoU = mIoU
+            _save_checkpoint(i_iter, model, optimizer, config, ema_model, save_best=True)
 
-    if use_tensorboard:
-        tensorboard_writer.add_scalar('Validation/mIoU', mIoU, i_iter)
-        tensorboard_writer.add_scalar('Validation/Loss', val_loss, i_iter)
+        if use_tensorboard:
+            tensorboard_writer.add_scalar('Validation/mIoU', mIoU, i_iter)
+            tensorboard_writer.add_scalar('Validation/Loss', val_loss, i_iter)
 
     end = timeit.default_timer()
-    print('Total time: ' + str(end-start) + ' seconds')
+    if is_main_process():
+        print('Total time: ' + str(end-start) + ' seconds')
+    cleanup_distributed()
 
 if __name__ == '__main__':
 
@@ -621,10 +723,18 @@ if __name__ == '__main__':
         split_id = None
 
     if config['pretrained'] == 'coco':
-        restore_from = 'http://vllab1.ucmerced.edu/~whung/adv-semi-seg/resnet101COCO-41f33a49.pth'
+        if os.path.exists(CLASSMIX_COCO_PRETRAIN):
+            restore_from = CLASSMIX_COCO_PRETRAIN
+        else:
+            restore_from = 'http://vllab1.ucmerced.edu/~whung/adv-semi-seg/resnet101COCO-41f33a49.pth'
+    elif config['pretrained'] in (None, '', 'none', 'None'):
+        restore_from = None
+    else:
+        restore_from = config['pretrained']
 
     batch_size = config['training']['batch_size']
     num_iterations = config['training']['num_iterations']
+    training_epochs = config['training'].get('epochs')
 
     input_size_string = config['training']['data']['input_size']
     h, w = map(int, input_size_string.split(','))
@@ -640,10 +750,16 @@ if __name__ == '__main__':
     weight_decay = config['training']['weight_decay']
     momentum = config['training']['momentum']
     num_workers = config['training']['num_workers']
+    unlabeled_num_workers = config['training'].get('unlabeled_num_workers', num_workers)
+    val_num_workers = config['training'].get('val_num_workers', num_workers)
+    pin_memory = config['training'].get('pin_memory', True)
+    prefetch_factor = config['training'].get('prefetch_factor', 2)
+    persistent_workers = config['training'].get('persistent_workers', True)
     use_sync_batchnorm = config['training']['use_sync_batchnorm']
     random_seed = config['seed']
 
     labeled_samples = config['training']['data']['labeled_samples']
+    split_percent = config['training']['data'].get('split_percent')
 
     #unlabeled CONFIGURATIONS
     train_unlabeled = config['training']['unlabeled']['train_unlabeled']
@@ -670,12 +786,19 @@ if __name__ == '__main__':
     log_per_iter = config['utils']['log_per_iter']
 
     save_best_model = config['utils']['save_best_model']
-    if args.save_images:
+    distributed, local_rank, rank, world_size = setup_distributed()
+    if args.gpus > 1 and not distributed:
+        raise RuntimeError(
+            'ClassMix now uses DistributedDataParallel. Launch multi-GPU runs with '
+            '`torchrun --nproc_per_node=<num_gpus> ClassMix/trainSSL.py ...`.'
+        )
+
+    if args.save_images and is_main_process():
         print('Saving unlabeled images')
         save_unlabeled_images = True
     else:
         save_unlabeled_images = False
 
-    gpus = (0,1,2,3)[:args.gpus]
+    gpus = (local_rank,)
 
     main()

@@ -11,47 +11,49 @@ from torch.utils import data
 from PIL import Image
 
 class FloodNetDataset(data.Dataset):
-    def __init__(self, root, split="train", max_iters=None, crop_size=(750, 750), scale=True, mirror=True, ignore_label=255, unlabeled=False):
+    def __init__(self, root, split="train", max_iters=None, crop_size=(750, 750), scale=True, mirror=True, ignore_label=255, unlabeled=False, split_percent=None):
         self.root = root
         self.crop_h, self.crop_w = crop_size
         self.scale = scale
         self.ignore_label = ignore_label
         self.is_mirror = mirror
         if split == "train":
-            list_path = './data/floodnet/train/labeled.txt'
+            if split_percent is not None:
+                list_path = f'./data/floodnet/splits/{split_percent}/labeled.txt'
+            else:
+                list_path = './data/floodnet/train/labeled.txt'
             if unlabeled:
-                list_path = './data/floodnet/train/unlabeled.txt'
+                if split_percent is not None:
+                    list_path = f'./data/floodnet/splits/{split_percent}/unlabeled.txt'
+                else:
+                    list_path = './data/floodnet/train/unlabeled.txt'
         elif split == 'val':
             list_path =  './data/floodnet/val.txt'
-        self.img_ids = [i_id.split(' ')[0].strip() for i_id in open(list_path)]
+        self.samples = []
+        with open(list_path) as f:
+            for line in f:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                if len(parts) == 1:
+                    image_rel = f'train/train-org-img/{parts[0]}.jpg'
+                    label_rel = f'train/train-label-img/{parts[0]}_lab.png'
+                else:
+                    image_rel, label_rel = parts[0], parts[1]
+                self.samples.append((image_rel, label_rel))
 
         if not max_iters==None:
-	        self.img_ids = self.img_ids * int(np.ceil(float(max_iters) / len(self.img_ids)))
+	        self.samples = self.samples * int(np.ceil(float(max_iters) / len(self.samples)))
 
 
         self.files = []
         # for split in ["train", "trainval", "val"]:
-        if not unlabeled:
-            for name in self.img_ids:
-                img_file = f"../../../data/jpk322/FloodNet/{name}"
-                label_file = f"../../../data/jpk322/FloodNet/{name[:-4].replace('org', 'label')}_lab.png"
-                if split == 'val':
-                    img_file = f"../../../data/jpk322/FloodNet/{name}".replace('train','val')
-                    label_file = f"../../../data/jpk322/FloodNet/{name[:-4].replace('org', 'label').replace('train','val')}_lab.png"
-                self.files.append({
-                    "img": img_file,
-                    "label": label_file,
-                    "name": name
-                })
-        elif unlabeled:
-            for name in self.img_ids:
-                img_file = f"../../../data/jpk322/FloodNet/{name}"
-                label_file = f"../../../data/jpk322/FloodNet/train/train-unlabel-img/blank.png"
-                self.files.append({
-                    "img": img_file,
-                    "label": label_file,
-                    "name": name
-                })
+        for image_rel, label_rel in self.samples:
+            self.files.append({
+                "img": osp.join(self.root, image_rel),
+                "label": osp.join(self.root, label_rel),
+                "name": image_rel
+            })
 
         IMG_MEAN = (104.00698793,116.66876762,122.67891434)
         self.mean = IMG_MEAN

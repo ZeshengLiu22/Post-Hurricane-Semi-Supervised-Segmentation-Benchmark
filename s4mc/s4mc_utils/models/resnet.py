@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from pathlib import Path
 
 from .base import get_syncbn
 
@@ -17,7 +18,7 @@ model_urls = {
     "resnet18": "/path/to/resnet18.pth",
     "resnet34": "/path/to/resnet34.pth",
     "resnet50": "/path/to/resnet50.pth",
-    "resnet101": "/home/ubuntu/s4mc/resnet101.pth",
+    "resnet101": str(Path(__file__).resolve().parents[2] / "resnet101.pth"),
     "resnet152": "/path/to/resnet152.pth",
 }
 

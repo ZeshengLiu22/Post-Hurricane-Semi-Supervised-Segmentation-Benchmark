@@ -45,18 +45,54 @@ def colorize_mask(mask, colormap):
     return color_mask
 
 
-def intersection_and_union(pred, target, num_classes, ignore_index=255):
-    pred = pred.flatten()
-    target = target.flatten()
-    mask = target != ignore_index
-    pred = pred[mask]
-    target = target[mask]
-    intersection = pred[pred == target]
-    area_intersection = np.bincount(intersection, minlength=num_classes)
-    area_pred = np.bincount(pred, minlength=num_classes)
-    area_target = np.bincount(target, minlength=num_classes)
-    area_union = area_pred + area_target - area_intersection
-    return area_intersection, area_union, area_target
+def nanmean_or_nan(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(values.mean()) if values.size else float("nan")
+
+
+def nanstd_or_nan(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(values.std(ddof=0)) if values.size else float("nan")
+
+
+def metric_string(value):
+    value = float(value)
+    return f"{value:.4f}" if np.isfinite(value) else "nan"
+
+
+def confusion_matrix_from_arrays(pred, target, num_classes, ignore_index=None):
+    pred = np.asarray(pred).reshape(-1).astype(np.int64, copy=False)
+    target = np.asarray(target).reshape(-1).astype(np.int64, copy=False)
+    valid = (target >= 0) & (target < num_classes)
+    valid &= (pred >= 0) & (pred < num_classes)
+    if ignore_index is not None:
+        valid &= target != ignore_index
+    if not np.any(valid):
+        return np.zeros((num_classes, num_classes), dtype=np.int64)
+    bins = target[valid] * num_classes + pred[valid]
+    return np.bincount(bins, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+
+def compute_metrics_from_confusion(confusion):
+    confusion = confusion.astype(np.float64, copy=False)
+    intersection = np.diag(confusion)
+    target_pixels = confusion.sum(axis=1)
+    predicted_pixels = confusion.sum(axis=0)
+    union = target_pixels + predicted_pixels - intersection
+    iou = np.full(confusion.shape[0], np.nan, dtype=np.float64)
+    np.divide(intersection, union, out=iou, where=union > 0)
+    total_target = target_pixels.sum()
+    fwiou = float(np.nansum(target_pixels * iou) / total_target) if total_target > 0 else float("nan")
+    return {
+        "intersection": intersection,
+        "union": union,
+        "target_pixels": target_pixels,
+        "predicted_pixels": predicted_pixels,
+        "iou": iou,
+        "FWIoU": fwiou,
+    }
 
 
 def main():
@@ -85,9 +121,9 @@ def main():
     model.cuda().eval()
 
     image_names = sorted(os.listdir(args.val_img_dir))
-    total_inter = np.zeros(args.num_classes)
-    total_union = np.zeros(args.num_classes)
-    total_target = np.zeros(args.num_classes)
+    total_confusion = np.zeros((args.num_classes, args.num_classes), dtype=np.int64)
+    per_image_ious = []
+    per_image_ious_no_background = []
 
     for name in tqdm(image_names, desc='Evaluating'):
         img_path = os.path.join(args.val_img_dir, name)
@@ -113,20 +149,38 @@ def main():
         save_path = os.path.join(args.save_dir, base_name + '.png')
         Image.fromarray(color_mask).save(save_path)
 
-        inter, union, target = intersection_and_union(pred_mask, gt_mask, args.num_classes)
-        total_inter += inter
-        total_union += union
-        total_target += target
+        per_confusion = confusion_matrix_from_arrays(pred_mask, gt_mask, args.num_classes, ignore_index=255)
+        total_confusion += per_confusion
+        per_metrics = compute_metrics_from_confusion(per_confusion)
+        present = per_metrics["target_pixels"] > 0
+        present_no_background = present.copy()
+        if present_no_background.size:
+            present_no_background[0] = False
+        per_image_ious.append(nanmean_or_nan(per_metrics["iou"][present]))
+        per_image_ious_no_background.append(nanmean_or_nan(per_metrics["iou"][present_no_background]))
 
-    iou = total_inter / (total_union + 1e-10)
-    miou = np.nanmean(iou)
-    fwiou = (total_target * iou).sum() / (total_target.sum() + 1e-10)
+    metrics = compute_metrics_from_confusion(total_confusion)
+    iou = metrics["iou"]
+    no_background = np.ones(args.num_classes, dtype=bool)
+    if args.num_classes:
+        no_background[0] = False
+    miou = nanmean_or_nan(iou)
+    miou_no_background = nanmean_or_nan(iou[no_background])
 
     print("\n==== RescueNet Evaluation (GPU, 2× Downscaled) ====")
     for i, class_iou in enumerate(iou):
-        print(f"Class {i}: IoU = {class_iou:.4f}")
-    print(f"Mean IoU: {miou:.4f}")
-    print(f"FWIoU:    {fwiou:.4f}")
+        print(f"Class {i}: IoU = {metric_string(class_iou)}")
+    print(f"Mean IoU: {metric_string(miou)}")
+    print(f"Mean IoU no background: {metric_string(miou_no_background)}")
+    print(f"FWIoU:    {metric_string(metrics['FWIoU'])}")
+    print(
+        f"Per-image mIoU: mean={metric_string(nanmean_or_nan(per_image_ious))}, "
+        f"std={metric_string(nanstd_or_nan(per_image_ious))}"
+    )
+    print(
+        f"Per-image mIoU no background: mean={metric_string(nanmean_or_nan(per_image_ious_no_background))}, "
+        f"std={metric_string(nanstd_or_nan(per_image_ious_no_background))}"
+    )
 
 
 if __name__ == '__main__':

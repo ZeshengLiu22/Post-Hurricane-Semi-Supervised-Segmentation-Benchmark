@@ -6,7 +6,12 @@ import numpy as np
 from mmcv import Config
 from mmseg.datasets import build_dataset, build_dataloader
 from seg_core.model import MiT_SegFormer
-from seg_core import eval_seg
+from final_eval_metrics import scores
+
+
+def metric_string(value):
+    value = float(value)
+    return f"{value:.4f}" if np.isfinite(value) else "nan"
 
 
 def val(model, data_loader, num_classes):
@@ -20,7 +25,7 @@ def val(model, data_loader, num_classes):
             output = F.interpolate(output, size=label.shape[1:], mode='bilinear', align_corners=False)
             preds += list(torch.argmax(output, dim=1).cpu().numpy().astype(np.int16))
             gts += list(label.cpu().numpy().astype(np.int16))
-    score = eval_seg.scores(gts, preds, num_classes=num_classes)
+    score = scores(gts, preds, num_classes=num_classes, ignore_index=255)
     return score
 
 
@@ -59,9 +64,18 @@ def main():
 
     print("\n==== Evaluation Results ====")
     for class_id, iou in score['Class IoU'].items():
-        print(f"Class {class_id}: IoU = {iou:.4f}")
-    print(f"Mean IoU: {score['Mean IoU'] * 100:.2f}")
-    print(f"FWIoU:    {score['FWIoU'] * 100:.2f}")
+        print(f"Class {class_id}: IoU = {metric_string(iou)}")
+    print(f"Mean IoU: {metric_string(score['Mean IoU'])}")
+    print(f"Mean IoU no background: {metric_string(score['Mean IoU no background'])}")
+    print(f"FWIoU:    {metric_string(score['FWIoU'])}")
+    print(
+        f"Per-image mIoU: mean={metric_string(score['Per-image Mean IoU'])}, "
+        f"std={metric_string(score['Per-image Mean IoU Std'])}"
+    )
+    print(
+        f"Per-image mIoU no background: mean={metric_string(score['Per-image Mean IoU no background'])}, "
+        f"std={metric_string(score['Per-image Mean IoU no background Std'])}"
+    )
 
 
 if __name__ == '__main__':

@@ -1,37 +1,67 @@
-Code used for the results in the paper  ["ClassMix: Segmentation-Based Data Augmentation for Semi-Supervised Learning"](https://arxiv.org/abs/2007.07936)
-## Getting started
-### Prerequisites
-*  CUDA/CUDNN 
-*  Python3
-*  Packages found in requirements.txt
+# ClassMix
 
-### Datasets
+This directory contains the adapted ClassMix code used in the post-hurricane semi-supervised segmentation benchmark.
 
-#### Cityscapes
-Download the dataset from the Cityscapes dataset server([Link](https://www.cityscapes-dataset.com/)). Download the files named 'gtFine_trainvaltest.zip', 'leftImg8bit_trainvaltest.zip' and extract in ../data/CityScapes/
+Use the root project README for the full benchmark workflow. This file only covers direct ClassMix commands.
 
-#### Pascal VOC 2012
-Download the dataset from [here](http://host.robots.ox.ac.uk/pascal/VOC/voc2012/). Download the file 'training/validation data' under 'Development kit' and extract in ../data/VOC2012/. For training, you will also need to download additional labels from this [link](https://drive.google.com/file/d/1P0YpiEX1t-gY954WFXlKII667PAs4WNP/view?usp=sharing), extract this directory into ../data/VOC2012.
+## Setup
 
-### Input arguments
-Arguments related to running the script are specified from terminal and include; number of gpus to use (if >1 torch.nn.DataParalell is used), path to configuration file (see below), path to .pth file if resuming training, name of the experiment, and whether to save images during training. More details can be found in the relevant scripts.
+From the repository root:
 
-Arguments related to the algoritms are specified in the configuration files. These include model, data, hyperparameters related to the training, and what methods to apply on unlabeled data. A full description is provided further below.
+```bash
+python3 tools/prepare_method_datasets.py
+python3 tools/check_pretrained_weights.py
+```
 
-### Examples
-#### Training a model with semi-supervised learning with example config on a single gpu
+The setup creates `ClassMix/dataset/` symlinks, `ClassMix/data/{dataset}/splits/` files, generated `configs/config{Dataset}{Split}.json` files, and expects `ClassMix/pretrained/resnet101COCO-41f33a49.pth`.
 
-```python3 trainSSL.py --config ./configs/configCityscapes.json --name name_of_training```
+Activate the ClassMix environment before running:
 
-#### Resuming training of a model with semi-supervised learning
+```bash
+conda activate classmix
+```
 
-```python3 trainSSL.py --resume path/to/checkpoint.pth --name name_of_training```
+## Run All Benchmark Splits
 
-#### Evaluating a trained model
+From the repository root:
 
-```python3 evaluateSSL.py --model-path path/to/checkpoint.pth```
+```bash
+bash scripts/run_classmix_benchmark.sh
+```
 
-### Pretrained model
-[Here](https://drive.google.com/file/d/1JXlFsEqCi8onvmS8JwhZlYXJIIe0Mdyj/view?usp=sharing) is a model trained with SSL with 1/8 (372) labeled samples for Cityscapes.
+Useful overrides:
 
+```bash
+RUN_ID=trial1 NUM_GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts/run_classmix_benchmark.sh
+PREP_DATA=0 AMP=true AMP_DTYPE=bf16 BASE_PORT=29620 bash scripts/run_classmix_benchmark.sh
+SAVE_IMAGES=true RUN_ID=debug_images bash scripts/run_classmix_benchmark.sh
+```
 
+## Direct Training
+
+Run from `ClassMix/`. Multi-GPU training uses DDP through `torchrun`.
+
+```bash
+cd ClassMix
+torchrun --nproc_per_node=4 --master_port=29600 trainSSL.py \
+  --gpus 4 \
+  --config ./configs/configRescueNet25.json \
+  --name rescuenet_25_manual \
+  --amp true \
+  --amp-dtype bf16
+```
+
+Use `configFloodNet12_5.json`, `configFloodNet25.json`, `configFloodNet50.json`, `configRescueNet12_5.json`, `configRescueNet25.json`, or `configRescueNet50.json`.
+
+## Direct Evaluation
+
+```bash
+cd ClassMix
+python evaluateSSL.py --model-path checkpoints/path/to/best_model.pth
+```
+
+For comparable cross-method metrics, prefer the root `tools/evaluate_semi_supervised_final.py` evaluator.
+
+## Upstream Reference
+
+Original project: <https://github.com/WilhelmT/ClassMix>

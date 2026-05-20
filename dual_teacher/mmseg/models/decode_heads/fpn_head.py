@@ -5,7 +5,6 @@ from mmcv.cnn import ConvModule
 from mmseg.ops import resize
 from ..builder import HEADS
 from .decode_head import BaseDecodeHead
-from IPython import embed
 
 @HEADS.register_module()
 class FPNHead(BaseDecodeHead):

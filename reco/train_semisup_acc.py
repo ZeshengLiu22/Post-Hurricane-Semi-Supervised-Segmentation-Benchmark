@@ -10,6 +10,7 @@ import torch
 import torchvision.models as models
 import torch.optim as optim
 import argparse
+import os
 
 from network.deeplabv3.deeplabv3 import *
 from network.deeplabv2 import *
@@ -17,13 +18,19 @@ from build_data import *
 from module_list import *
 from tqdm.auto import tqdm
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedDataParallelKwargs
 import warnings
 warnings.filterwarnings("ignore")
 
 
-accelerator = Accelerator(device_placement=True, step_scheduler_with_optimizer= False)
-torch.autograd.set_detect_anomaly(True)
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+accelerator = Accelerator(
+    device_placement=True,
+    step_scheduler_with_optimizer=False,
+    mixed_precision='bf16',
+    kwargs_handlers=[ddp_kwargs],
+)
+torch.autograd.set_detect_anomaly(False)
 
 
 parser = argparse.ArgumentParser(description='Semi-supervised Segmentation with Perfect Labels')
@@ -32,9 +39,10 @@ parser.add_argument('--port', default=None, type=int)
 
 parser.add_argument('--gpu', default=0, type=int)
 parser.add_argument('--num_labels', default=15, type=int, help='number of labelled training data, set 0 to use all training data')
+parser.add_argument('--split', default='25', choices=['12_5', '25', '50'], help='post-disaster labelled/unlabelled split percentage')
 parser.add_argument('--lr', default=2.5e-3, type=float)
 parser.add_argument('--weight_decay', default=5e-4, type=float)
-parser.add_argument('--dataset', default='cityscapes', type=str, help='pascal, cityscapes, sun')
+parser.add_argument('--dataset', default='cityscapes', type=str, help='pascal, cityscapes, sun, rescuenet, floodnet')
 parser.add_argument('--apply_aug', default='cutout', type=str, help='apply semi-supervised method: cutout cutmix classmix')
 parser.add_argument('--id', default=1, type=int, help='number of repeated samples')
 parser.add_argument('--weak_threshold', default=0.7, type=float)
@@ -47,14 +55,46 @@ parser.add_argument('--output_dim', default=256, type=int, help='output dimensio
 parser.add_argument('--backbone', default='deeplabv3p', type=str, help='choose backbone: deeplabv3p, deeplabv2')
 parser.add_argument('--seed', default=0, type=int)
 parser.add_argument('--num_gpu', default=8, type=int)
+parser.add_argument('--epochs', default=150, type=int)
+parser.add_argument('--num-workers', default=4, type=int)
+parser.add_argument('--val-num-workers', default=4, type=int)
+parser.add_argument('--pin-memory', default=False, type=lambda x: str(x).lower() in ('1', 'true', 'yes', 'y'))
+parser.add_argument('--prefetch-factor', default=4, type=int)
+parser.add_argument('--persistent-workers', default=True, type=lambda x: str(x).lower() in ('1', 'true', 'yes', 'y'))
+parser.add_argument('--output-root', default='.', type=str, help='root directory for model_weights/ and logging/')
+parser.add_argument('--run-id', default=None, type=str, help='optional suffix to avoid overwriting repeated runs')
 
 args = parser.parse_args()
+
+
+def run_tag(args):
+    tag = '{}_split{}_label{}_semi_{}_{}'.format(args.dataset, args.split, args.num_labels, args.apply_aug, args.seed)
+    if args.apply_reco:
+        tag = '{}_reco'.format(tag)
+    if args.run_id:
+        tag = '{}_{}'.format(tag, args.run_id)
+    return tag
 
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 random.seed(args.seed)
 
-data_loader = BuildDataLoader(args.dataset, args.num_labels)
+model_weights_dir = os.path.join(args.output_root, 'model_weights')
+logging_dir = os.path.join(args.output_root, 'logging')
+if accelerator.is_main_process:
+    os.makedirs(model_weights_dir, exist_ok=True)
+    os.makedirs(logging_dir, exist_ok=True)
+
+data_loader = BuildDataLoader(
+    args.dataset,
+    args.num_labels,
+    split=args.split,
+    num_workers=args.num_workers,
+    val_num_workers=args.val_num_workers,
+    pin_memory=args.pin_memory,
+    prefetch_factor=args.prefetch_factor,
+    persistent_workers=args.persistent_workers,
+)
 train_l_loader, train_u_loader, test_loader = data_loader.build(supervised=False)
 
 # Load Semantic Network
@@ -66,13 +106,14 @@ if args.backbone == 'deeplabv3p':
 elif args.backbone == 'deeplabv2':
     model = DeepLabv2(models.resnet101(pretrained=True), num_classes=data_loader.num_segments, output_dim=args.output_dim).to(accelerator.device)
 
-total_epoch = 200
+total_epoch = args.epochs
 ema = EMA(model, 0.99)  # Mean teacher model
 
 optimizer = optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay, momentum=0.9, nesterov=True)
 scheduler = PolyLR(optimizer, total_epoch, power=0.9)
 
-ema, optimizer, scheduler, train_l_loader, train_u_loader, compute_supervised_loss, compute_unsupervised_loss, compute_reco_loss = accelerator.prepare(ema, optimizer, scheduler, train_l_loader, train_u_loader, compute_supervised_loss, compute_unsupervised_loss, compute_reco_loss)
+model, ema.model, optimizer, scheduler, train_l_loader, train_u_loader, test_loader = accelerator.prepare(
+    model, ema.model, optimizer, scheduler, train_l_loader, train_u_loader, test_loader)
 
 train_epoch = len(train_l_loader)
 test_epoch = len(test_loader)
@@ -99,9 +140,10 @@ for index in tqdm(range(total_epoch), disable=not accelerator.is_local_main_proc
 
         # generate pseudo-labels
         with torch.no_grad():
-            pred_u, _ = ema.model(train_u_data)
-            pred_u_large_raw = F.interpolate(pred_u, size=train_u_label.shape[1:], mode='bilinear', align_corners=True)
-            pseudo_logits, pseudo_labels = torch.max(torch.softmax(pred_u_large_raw, dim=1), dim=1)
+            with accelerator.autocast():
+                pred_u, _ = ema.model(train_u_data)
+                pred_u_large_raw = F.interpolate(pred_u, size=train_u_label.shape[1:], mode='bilinear', align_corners=True)
+                pseudo_logits, pseudo_labels = torch.max(torch.softmax(pred_u_large_raw, dim=1), dim=1)
 
             # random scale images first
             train_u_aug_data, train_u_aug_label, train_u_aug_logits = \
@@ -118,43 +160,42 @@ for index in tqdm(range(total_epoch), disable=not accelerator.is_local_main_proc
                                 data_loader.crop_size, (1.0, 1.0), apply_augmentation=True)
 
         # generate labelled and unlabelled data loss
-        pred_l, rep_l = model(train_l_data)
-        pred_l_large = F.interpolate(pred_l, size=train_l_label.shape[1:], mode='bilinear', align_corners=True)
+        with accelerator.autocast():
+            labeled_batch_size = train_l_data.shape[0]
+            pred_all, rep_all = model(torch.cat((train_l_data, train_u_aug_data), dim=0))
+            pred_l, pred_u = pred_all[:labeled_batch_size], pred_all[labeled_batch_size:]
+            rep_l, rep_u = rep_all[:labeled_batch_size], rep_all[labeled_batch_size:]
 
-        pred_u, rep_u = model(train_u_aug_data)
-        pred_u_large = F.interpolate(pred_u, size=train_l_label.shape[1:], mode='bilinear', align_corners=True)
+            pred_l_large = F.interpolate(pred_l, size=train_l_label.shape[1:], mode='bilinear', align_corners=True)
+            pred_u_large = F.interpolate(pred_u, size=train_l_label.shape[1:], mode='bilinear', align_corners=True)
 
-        rep_all = torch.cat((rep_l, rep_u))
-        pred_all = torch.cat((pred_l, pred_u))
+            # supervised-learning loss
+            sup_loss = compute_supervised_loss(pred_l_large, train_l_label)
 
-        # supervised-learning loss
-        sup_loss = compute_supervised_loss(pred_l_large, train_l_label) 
+            # unsupervised-learning loss
+            unsup_loss = compute_unsupervised_loss(pred_u_large, train_u_aug_label, train_u_aug_logits, args.strong_threshold)
 
-        # unsupervised-learning loss
-        unsup_loss = compute_unsupervised_loss(pred_u_large, train_u_aug_label, train_u_aug_logits, args.strong_threshold)
+            # apply regional contrastive loss
+            if args.apply_reco:
+                with torch.no_grad():
+                    train_u_aug_mask = train_u_aug_logits.ge(args.weak_threshold).float()
+                    mask_all = torch.cat(((train_l_label.unsqueeze(1) >= 0).float(), train_u_aug_mask.unsqueeze(1)))
+                    mask_all = F.interpolate(mask_all, size=pred_all.shape[2:], mode='nearest')
 
-        # apply regional contrastive loss
-        if args.apply_reco:
-            with torch.no_grad():
-                train_u_aug_mask = train_u_aug_logits.ge(args.weak_threshold).float()
-                mask_all = torch.cat(((train_l_label.unsqueeze(1) >= 0).float(), train_u_aug_mask.unsqueeze(1)))
-                mask_all = F.interpolate(mask_all, size=pred_all.shape[2:], mode='nearest')
+                    label_l = F.interpolate(label_onehot(train_l_label, data_loader.num_segments), size=pred_all.shape[2:], mode='nearest')
+                    label_u = F.interpolate(label_onehot(train_u_aug_label, data_loader.num_segments), size=pred_all.shape[2:], mode='nearest')
+                    label_all = torch.cat((label_l, label_u))
 
-                label_l = F.interpolate(label_onehot(train_l_label, data_loader.num_segments), size=pred_all.shape[2:], mode='nearest')
-                label_u = F.interpolate(label_onehot(train_u_aug_label, data_loader.num_segments), size=pred_all.shape[2:], mode='nearest')
-                label_all = torch.cat((label_l, label_u))
+                    prob_l = torch.softmax(pred_l, dim=1)
+                    prob_u = torch.softmax(pred_u, dim=1)
+                    prob_all = torch.cat((prob_l, prob_u))
 
-                prob_l = torch.softmax(pred_l, dim=1)
-                prob_u = torch.softmax(pred_u, dim=1)
-                prob_all = torch.cat((prob_l, prob_u))
-
-            reco_loss = compute_reco_loss(rep_all, label_all, mask_all, prob_all, args.strong_threshold,
-                                        args.temp, args.num_queries, args.num_negatives)
-        else:
-            reco_loss = torch.tensor(0.0)
+                reco_loss = compute_reco_loss(rep_all, label_all, mask_all, prob_all, args.strong_threshold,
+                                            args.temp, args.num_queries, args.num_negatives)
+            else:
+                reco_loss = pred_l.new_tensor(0.0)
         
-        loss = sup_loss + unsup_loss + reco_loss
-        accelerator.wait_for_everyone()
+            loss = sup_loss + unsup_loss + reco_loss
         
         #loss.backward()
         accelerator.backward(loss)
@@ -177,22 +218,31 @@ for index in tqdm(range(total_epoch), disable=not accelerator.is_local_main_proc
 
     with torch.no_grad():
         ema.model.eval()
-        test_dataset = iter(test_loader)
         conf_mat = ConfMatrix(data_loader.num_segments)
-        for i in range(test_epoch):
-            test_data, test_label = next(test_dataset) #Changed by Zesheng for debug
-            test_data, test_label = test_data.to(device), test_label.to(device)
+        test_loss_sum = torch.tensor(0.0, device=device)
+        test_sample_count = torch.tensor(0.0, device=device)
+        for test_data, test_label in test_loader:
 
-            pred, rep = ema.model(test_data)
-            pred = F.interpolate(pred, size=test_label.shape[1:], mode='bilinear', align_corners=True)
-            # Add Post-processing here
+            with accelerator.autocast():
+                pred, rep = ema.model(test_data)
+                pred = F.interpolate(pred, size=test_label.shape[1:], mode='bilinear', align_corners=True)
+                # Add Post-processing here
 
-            loss = compute_supervised_loss(pred, test_label)
+                loss = compute_supervised_loss(pred, test_label)
 
             conf_mat.update(pred.argmax(1).flatten(), test_label.flatten())
-            avg_cost[index, 7] += loss.item() / test_epoch
+            test_loss_sum += loss.detach() * test_data.shape[0]
+            test_sample_count += test_data.shape[0]
+
+        if conf_mat.mat is None:
+            conf_mat.mat = torch.zeros((data_loader.num_segments, data_loader.num_segments), dtype=torch.int64, device=device)
+
+        conf_mat.mat = accelerator.reduce(conf_mat.mat, reduction="sum")
+        test_loss_sum = accelerator.reduce(test_loss_sum, reduction="sum")
+        test_sample_count = accelerator.reduce(test_sample_count, reduction="sum")
 
         miou, acc, iou_per_class = conf_mat.get_metrics(test=True)
+        avg_cost[index, 7] = (test_loss_sum / test_sample_count.clamp_min(1)).item()
         avg_cost[index, 8] = miou
         avg_cost[index, 9] = acc
         
@@ -205,15 +255,12 @@ for index in tqdm(range(total_epoch), disable=not accelerator.is_local_main_proc
     if avg_cost[index][8] >= avg_cost[:, 8].max():
         best_iou_per_class = iou_per_class
         accelerator.print('Top IOU per class:', best_iou_per_class)
-        accelerator.print('Current Confusion Matrix:', conf_mat.get_conf_matrix())
+        accelerator.print('Current Confusion Matrix:', conf_mat.mat)
 
-        if args.apply_reco:
-            torch.save(accelerator.unwrap_model(ema.model).state_dict(), 'model_weights/{}_label{}_semi_{}_reco_{}.pth'.format(args.dataset, args.num_labels, args.apply_aug, args.seed))
-        else:
-            torch.save(accelerator.unwrap_model(ema.model).state_dict(), 'model_weights/{}_label{}_semi_{}_{}.pth'.format(args.dataset, args.num_labels, args.apply_aug, args.seed))
+        if accelerator.is_main_process:
+            tag = run_tag(args)
+            torch.save(accelerator.unwrap_model(ema.model).state_dict(), os.path.join(model_weights_dir, '{}.pth'.format(tag)))
 
-    if args.apply_reco:
-        np.save('logging/{}_label{}_semi_{}_reco_{}.npy'.format(args.dataset, args.num_labels, args.apply_aug, args.seed), avg_cost)
-    else:
-        np.save('logging/{}_label{}_semi_{}_{}.npy'.format(args.dataset, args.num_labels, args.apply_aug, args.seed), avg_cost)
-
+    if accelerator.is_main_process:
+        tag = run_tag(args)
+        np.save(os.path.join(logging_dir, '{}.npy'.format(tag)), avg_cost)

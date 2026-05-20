@@ -23,7 +23,7 @@ model = dict(
         feature_strides=[4, 8, 16, 32],
         channels=128,
         dropout_ratio=0.1,
-        num_classes=150,
+        num_classes=11,
         norm_cfg=norm_cfg,
         align_corners=False,
         decoder_params=dict(embed_dim=256),
@@ -45,5 +45,5 @@ scheduler = dict(_delete_=True, policy='poly',
                  warmup_ratio=1e-6,
                  power=1.0, min_lr=0.0, by_epoch=False)
 
-data = dict(samples_per_gpu=1)
+data = dict(samples_per_gpu=4)
 evaluation = dict(interval=16000, metric='mIoU')

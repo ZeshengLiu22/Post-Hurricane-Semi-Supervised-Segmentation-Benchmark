@@ -147,6 +147,56 @@ def get_label_vector(target, nclass):
 
     return vect_out
 
+def nanmean_or_nan(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(values.mean()) if values.size else float("nan")
+
+
+def nanstd_or_nan(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(values.std(ddof=0)) if values.size else float("nan")
+
+
+def metric_string(value):
+    value = float(value)
+    return f"{value:.6f}" if np.isfinite(value) else "nan"
+
+
+def confusion_matrix_from_arrays(pred, target, num_classes, ignore_index=None):
+    pred = np.asarray(pred).reshape(-1).astype(np.int64, copy=False)
+    target = np.asarray(target).reshape(-1).astype(np.int64, copy=False)
+    valid = (target >= 0) & (target < num_classes)
+    valid &= (pred >= 0) & (pred < num_classes)
+    if ignore_index is not None:
+        valid &= target != ignore_index
+    if not np.any(valid):
+        return np.zeros((num_classes, num_classes), dtype=np.int64)
+    bins = target[valid] * num_classes + pred[valid]
+    return np.bincount(bins, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+
+def compute_metrics_from_confusion(confusion):
+    confusion = confusion.astype(np.float64, copy=False)
+    intersection = np.diag(confusion)
+    target_pixels = confusion.sum(axis=1)
+    predicted_pixels = confusion.sum(axis=0)
+    union = target_pixels + predicted_pixels - intersection
+    iou = np.full(confusion.shape[0], np.nan, dtype=np.float64)
+    np.divide(intersection, union, out=iou, where=union > 0)
+    total_target = target_pixels.sum()
+    fwiou = float(np.nansum(target_pixels * iou) / total_target) if total_target > 0 else float("nan")
+    return {
+        "intersection": intersection,
+        "union": union,
+        "target_pixels": target_pixels,
+        "predicted_pixels": predicted_pixels,
+        "iou": iou,
+        "FWIoU": fwiou,
+    }
+
+
 def get_iou(data_list, class_num, dataset, save_path=None):
     from multiprocessing import Pool
     from utils.metric import ConfusionMatrix
@@ -186,11 +236,11 @@ def get_iou(data_list, class_num, dataset, save_path=None):
             "train", "motorcycle", "bicycle"))
 
     elif dataset== 'rescuenet':
-        classes = np.array(('background', 'Water', 'Building_No_Damage', 'Building_Minor_Damage', 
+        classes = np.array(('background', 'Water', 'Building_No_Damage', 'Building_Minor_Damage',
             'Building_Major_Damage', 'Building_Total_Destruction', 'Vehicle', 'Road-Clear', 'Road-Blocked', 'Tree', 'Pool'))
 
     elif dataset== 'floodnet':
-        classes = np.array(('Background', 'Building-flooded', 'Building-non-flooded', 'Road-flooded', 
+        classes = np.array(('Background', 'Building-flooded', 'Building-non-flooded', 'Road-flooded',
             'Road-non-flooded', 'Water', 'Tree', 'Vehicle', 'Pool', 'Grass'))
 
 
@@ -207,7 +257,109 @@ def get_iou(data_list, class_num, dataset, save_path=None):
             f.write('FWIoU: ' + str(fwiou) + '\n')
     return aveJ
 
-def evaluate(model, dataset, ignore_label=250, save_output_images=False, save_dir=None, input_size=(512,1024)):
+
+def get_iou_final(data_list, class_num, dataset, save_path=None, ignore_index=None):
+    confusion = np.zeros((class_num, class_num), dtype=np.int64)
+    per_image_mious = []
+    per_image_mious_no_background = []
+
+    for gt, pred in data_list:
+        per_confusion = confusion_matrix_from_arrays(pred, gt, class_num, ignore_index)
+        confusion += per_confusion
+
+        per_metrics = compute_metrics_from_confusion(per_confusion)
+        present = per_metrics["target_pixels"] > 0
+        present_no_background = present.copy()
+        if present_no_background.size:
+            present_no_background[0] = False
+        per_image_mious.append(nanmean_or_nan(per_metrics["iou"][present]))
+        per_image_mious_no_background.append(nanmean_or_nan(per_metrics["iou"][present_no_background]))
+
+    metrics = compute_metrics_from_confusion(confusion)
+    j_list = metrics["iou"]
+    aveJ = nanmean_or_nan(j_list)
+    no_background = np.ones(class_num, dtype=bool)
+    if class_num:
+        no_background[0] = False
+    mean_no_background = nanmean_or_nan(j_list[no_background])
+
+    if dataset == 'pascal_voc':
+        classes = np.array(('background',  # always index 0
+            'aeroplane', 'bicycle', 'bird', 'boat',
+            'bottle', 'bus', 'car', 'cat', 'chair',
+            'cow', 'diningtable', 'dog', 'horse',
+            'motorbike', 'person', 'pottedplant',
+            'sheep', 'sofa', 'train', 'tvmonitor'))
+    elif dataset == 'cityscapes':
+        classes = np.array(("road", "sidewalk",
+            "building", "wall", "fence", "pole",
+            "traffic_light", "traffic_sign", "vegetation",
+            "terrain", "sky", "person", "rider",
+            "car", "truck", "bus",
+            "train", "motorcycle", "bicycle"))
+
+    elif dataset== 'rescuenet':
+        classes = np.array(('background', 'Water', 'Building_No_Damage', 'Building_Minor_Damage',
+            'Building_Major_Damage', 'Building_Total_Destruction', 'Vehicle', 'Road-Clear', 'Road-Blocked', 'Tree', 'Pool'))
+
+    elif dataset== 'floodnet':
+        classes = np.array(('Background', 'Building-flooded', 'Building-non-flooded', 'Road-flooded',
+            'Road-non-flooded', 'Water', 'Tree', 'Vehicle', 'Pool', 'Grass'))
+
+
+    for i, iou in enumerate(j_list):
+        print('class {:2d} {:12} IU {}'.format(i, classes[i], metric_string(iou)))
+
+    print('meanIOU: ' + metric_string(aveJ))
+    print('meanIOU_no_background: ' + metric_string(mean_no_background))
+    print('FWIoU: ' + metric_string(metrics["FWIoU"]))
+    print(
+        'per-image meanIOU: mean={}, std={}'.format(
+            metric_string(nanmean_or_nan(per_image_mious)),
+            metric_string(nanstd_or_nan(per_image_mious)),
+        )
+    )
+    print(
+        'per-image meanIOU_no_background: mean={}, std={}\n'.format(
+            metric_string(nanmean_or_nan(per_image_mious_no_background)),
+            metric_string(nanstd_or_nan(per_image_mious_no_background)),
+        )
+    )
+    if save_path:
+        with open(save_path, 'w') as f:
+            for i, iou in enumerate(j_list):
+                f.write('class {:2d} {:12} IU {}'.format(i, classes[i], metric_string(iou)) + '\n')
+            f.write('meanIOU: ' + metric_string(aveJ) + '\n')
+            f.write('meanIOU_no_background: ' + metric_string(mean_no_background) + '\n')
+            f.write('FWIoU: ' + metric_string(metrics["FWIoU"]) + '\n')
+            f.write(
+                'per-image meanIOU: mean={}, std={}\n'.format(
+                    metric_string(nanmean_or_nan(per_image_mious)),
+                    metric_string(nanstd_or_nan(per_image_mious)),
+                )
+            )
+            f.write(
+                'per-image meanIOU_no_background: mean={}, std={}\n'.format(
+                    metric_string(nanmean_or_nan(per_image_mious_no_background)),
+                    metric_string(nanstd_or_nan(per_image_mious_no_background)),
+                )
+            )
+    return aveJ
+
+def dataloader_kwargs(num_workers=0, pin_memory=True, prefetch_factor=2, persistent_workers=False):
+    kwargs = {
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+    }
+    if num_workers > 0:
+        kwargs['prefetch_factor'] = prefetch_factor
+        kwargs['persistent_workers'] = persistent_workers
+    return kwargs
+
+
+def evaluate(model, dataset, ignore_label=250, save_output_images=False, save_dir=None, input_size=(512,1024),
+             val_num_workers=0, pin_memory=True, prefetch_factor=2, persistent_workers=False,
+             amp_enabled=False, amp_dtype=torch.bfloat16, final_metrics=False):
 
     if dataset == 'pascal_voc':
         num_classes = 21
@@ -215,7 +367,12 @@ def evaluate(model, dataset, ignore_label=250, save_output_images=False, save_di
         data_loader = get_loader(dataset)
         data_path = get_data_path(dataset)
         test_dataset = data_loader(data_path, split="val", crop_size=input_size, scale=False, mirror=False)
-        testloader = data.DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=True)
+        testloader = data.DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            **dataloader_kwargs(val_num_workers, pin_memory, prefetch_factor, persistent_workers),
+        )
         interp = nn.Upsample(size=input_size, mode='bilinear', align_corners=True)
 
     elif dataset == 'cityscapes':
@@ -223,7 +380,12 @@ def evaluate(model, dataset, ignore_label=250, save_output_images=False, save_di
         data_loader = get_loader('cityscapes')
         data_path = get_data_path('cityscapes')
         test_dataset = data_loader( data_path, img_size=input_size, is_transform=True, split='val')
-        testloader = data.DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=True)
+        testloader = data.DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            **dataloader_kwargs(val_num_workers, pin_memory, prefetch_factor, persistent_workers),
+        )
         interp = nn.Upsample(size=input_size, mode='bilinear', align_corners=True)
     
     elif dataset == 'rescuenet':
@@ -232,7 +394,12 @@ def evaluate(model, dataset, ignore_label=250, save_output_images=False, save_di
         data_loader = get_loader('rescuenet')
         data_path = get_data_path('rescuenet')
         test_dataset = data_loader( data_path, crop_size=input_size, split='val')
-        testloader = data.DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=False)
+        testloader = data.DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            **dataloader_kwargs(val_num_workers, pin_memory, prefetch_factor, persistent_workers),
+        )
         interp = nn.Upsample(size=input_size, mode='bilinear', align_corners=True)
     
     elif dataset == 'floodnet':
@@ -241,13 +408,19 @@ def evaluate(model, dataset, ignore_label=250, save_output_images=False, save_di
         data_loader = get_loader('floodnet')
         data_path = get_data_path('floodnet')
         test_dataset = data_loader(data_path, crop_size=input_size, split='val')
-        testloader = data.DataLoader(test_dataset, batch_size=1, shuffle=False, pin_memory=False)
+        testloader = data.DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            **dataloader_kwargs(val_num_workers, pin_memory, prefetch_factor, persistent_workers),
+        )
         interp = nn.Upsample(size=input_size, mode='bilinear', align_corners=True)
 
     print('Evaluating, found ' + str(len(testloader)) + ' images.')
 
     data_list = []
     colorize = VOCColorize()
+    criterion = CrossEntropy2d(ignore_label=ignore_label).cuda()
 
     total_loss = []
 
@@ -256,15 +429,15 @@ def evaluate(model, dataset, ignore_label=250, save_output_images=False, save_di
         size = size[0]
 
         with torch.no_grad():
-            output  = model(Variable(image).cuda())
-            output = interp(output)
+            with torch.cuda.amp.autocast(enabled=amp_enabled and torch.cuda.is_available(), dtype=amp_dtype):
+                output  = model(Variable(image).cuda(non_blocking=True))
+                output = interp(output)
 
-            label_cuda = Variable(label.long()).cuda()
-            criterion = CrossEntropy2d(ignore_label=ignore_label).cuda()  # Ignore label ??
-            loss = criterion(output, label_cuda)
+                label_cuda = Variable(label.long()).cuda(non_blocking=True)
+                loss = criterion(output, label_cuda)
             total_loss.append(loss.item())
 
-            output = output.cpu().data[0].numpy()
+            output = output.float().cpu().data[0].numpy()
 
 
             if dataset == 'pascal_voc':
@@ -306,7 +479,10 @@ def evaluate(model, dataset, ignore_label=250, save_output_images=False, save_di
         filename = os.path.join(save_dir, 'result.txt')
     else:
         filename = None
-    mIoU = get_iou(data_list, num_classes, dataset, filename)
+    if final_metrics:
+        mIoU = get_iou_final(data_list, num_classes, dataset, filename, ignore_index=ignore_label)
+    else:
+        mIoU = get_iou(data_list, num_classes, dataset, filename)
     loss = np.mean(total_loss)
     return mIoU, loss
 
@@ -318,20 +494,31 @@ def main():
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    #model = torch.nn.DataParallel(Res_Deeplab(num_classes=num_classes), device_ids=args.gpu)
     model = Res_Deeplab(num_classes=num_classes)
 
     checkpoint = torch.load(args.model_path)
-    try:
-        model.load_state_dict(checkpoint['model'])
-    except:
-        model = torch.nn.DataParallel(model, device_ids=args.gpu)
-        model.load_state_dict(checkpoint['model'])
+    state_dict = checkpoint['model']
+    if any(key.startswith('module.') for key in state_dict.keys()):
+        state_dict = {key.replace('module.', '', 1): value for key, value in state_dict.items()}
+    model.load_state_dict(state_dict)
 
     model.cuda()
     model.eval()
     
-    evaluate(model, dataset, ignore_label=ignore_label, save_output_images=args.save_output_images, save_dir=save_dir, input_size=input_size)
+    loader_cfg = config.get('training', {})
+    evaluate(
+        model,
+        dataset,
+        ignore_label=ignore_label,
+        save_output_images=args.save_output_images,
+        save_dir=save_dir,
+        input_size=input_size,
+        val_num_workers=loader_cfg.get('val_num_workers', loader_cfg.get('num_workers', 0)),
+        pin_memory=loader_cfg.get('pin_memory', True),
+        prefetch_factor=loader_cfg.get('prefetch_factor', 2),
+        persistent_workers=loader_cfg.get('persistent_workers', False),
+        final_metrics=True,
+    )
 
 
 if __name__ == '__main__':

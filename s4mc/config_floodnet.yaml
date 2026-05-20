@@ -24,7 +24,11 @@ dataset: # Required.
   batch_size: 4
   n_sup: 398 #NUM
   noise_std: 0.1
-  workers: 2
+  workers: 8
+  val_workers: 8
+  pin_memory: True
+  prefetch_factor: 2
+  persistent_workers: True
   mean: [123.675, 116.28, 103.53]
   std: [58.395, 57.12, 57.375]
   ignore_label: 255

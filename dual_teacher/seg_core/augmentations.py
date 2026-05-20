@@ -188,7 +188,6 @@ def cut_mixer(data, target):
             target[u_rand_index[i], :, u_bbx1[i]:u_bbx2[i], u_bby1[i]:u_bby2[i]]
 
     del data, target
-    torch.cuda.empty_cache()
     return mix_data, mix_target.squeeze(dim=1)
 
 
@@ -229,14 +228,13 @@ def compute_classmix(b, h, w, criterion, cm_loss_fn, model, ema_model, imgs, lab
     pred_large = F.interpolate(outputs, size=labels.shape[1:], mode='bilinear', align_corners=False)
     sup_loss = criterion(pred_large, labels.type(torch.long).clone())
     del outputs, pred_large
-    torch.cuda.empty_cache()
     logits_class_mixed = F.interpolate(outputs_u, (h, w), mode="bilinear", align_corners=False)
 
     class_mixed_softmax = class_mix(occluder_mask=binary_mask, occluder=softmax_occluder, occludee=softmax_occluder[shuffle_index])
     max_prob_occluder, pseudo_label = torch.max(class_mixed_softmax, dim=1)
 
-    unlabeled_weight = torch.sum(max_prob_occluder.ge(threshold).long() == 1).item() / np.size(np.array(pseudo_label.cpu()))
-    pixel_weight = unlabeled_weight * torch.ones(max_prob_occluder.shape).cuda()
+    unlabeled_weight = max_prob_occluder.ge(threshold).float().sum() / pseudo_label.numel()
+    pixel_weight = torch.ones_like(max_prob_occluder) * unlabeled_weight
 
     class_mix_loss = cm_loss_fn(logits_class_mixed, pseudo_label, pixel_weight)
     loss = sup_loss + class_mix_loss
@@ -251,7 +249,6 @@ def compute_classmix(b, h, w, criterion, cm_loss_fn, model, ema_model, imgs, lab
 
 #     masked_data = occluder_mask.float() * occluder + (1 - occluder_mask.float()) * occludee
 #     del occluder_mask, occluder, occludee
-#     torch.cuda.empty_cache()
 #     return masked_data
 
 def class_mix(occluder_mask, occluder, occludee):
@@ -277,7 +274,6 @@ def class_mix(occluder_mask, occluder, occludee):
     masked_data = occluder_mask.float() * occluder + (1 - occluder_mask.float()) * occludee
 
     del occluder_mask, occluder, occludee
-    torch.cuda.empty_cache()
     return masked_data
 
 
@@ -305,7 +301,7 @@ def compute_ic(model, ema_model, image_u, image_u_strong, criterion_u, label_u, 
     pred_dc = F.interpolate(pred_dc, (h, w), mode="bilinear", align_corners=False)  # 513
     loss_dc = criterion_u(pred_dc, argmax_label)
     loss_dc = loss_dc * ((max_probs >= threshold) & (label_u != 255))
-    loss_dc = loss_dc.sum() / (label_u != 255).sum().item()
+    loss_dc = loss_dc.sum() / (label_u != 255).sum().clamp_min(1)
     return loss_dc.clone()
 
 
